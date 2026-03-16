@@ -253,7 +253,6 @@ cngpt sample --weights=<file> [options]
 | Option            | Default | Description                                           |
 |-------------------|---------|-------------------------------------------------------|
 | `--weights=FILE`  | *(req)* | Weight file                                           |
-| `--prompt=TEXT`   | `<\|endoftext\|>` | Initial context                            |
 | `--tokens=N`      | 200     | New tokens to generate                                |
 | `--temp=F`        | 1.0     | Sampling temperature (< 1 = more focused)             |
 | `--topk=K`        | 40      | Top-k filtering (0 = full distribution)               |
@@ -261,6 +260,11 @@ cngpt sample --weights=<file> [options]
 
 Without `--vocab`, token ids are printed as `[N]`. With the vocab file exported
 by `export_weights.py`, GPT-2 byte-pair encodings are decoded to Unicode.
+
+**Note on prompts**: GPT-2 BPE tokenization requires Python. The C binary
+starts generation from token 50256 (`<|endoftext|>`), which signals the
+beginning of a new document. To start from a specific context, pre-tokenize
+with `tiktoken` in Python and pass the resulting integer ids.
 
 ### bench
 
@@ -575,6 +579,35 @@ ALL CHECKS PASSED
 The logit tolerance is 5e-4 (default). A 12-layer float32 forward pass
 through OpenBLAS and PyTorch's cuBLAS/MKL backends accumulates ~2e-4 of
 rounding difference — this is expected float32 precision at this depth.
+
+### Sample output after Shakespeare fine-tuning
+
+After 500 steps fine-tuning GPT-2 small on Shakespeare (B=1, T=128, ~30 min
+on a laptop CPU), sampled at temp=0.8 top-k=40:
+
+```
+--- Generating 100 tokens (temp=0.80, top_k=40) ---
+
+<|endoftext|>I would live, but my lord
+How high should I be, I must be!
+I would meet you from the Tower, and tell you
+My lord, no child shall speak of it.
+
+KING RICHARD III:
+Why, then, my lords, shall I?
+
+KING RICHARD III:
+For how have you come to this news?
+
+KING RICHARD III:
+In what way, my lord?
+
+KING RICHARD
+```
+
+The model picks up Elizabethan vocabulary and speaker-labeled dialogue
+structure after a very short fine-tune run. More steps (5000+, preferably
+on GPU) produce consistently higher-quality output.
 
 ---
 

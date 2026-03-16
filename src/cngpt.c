@@ -220,13 +220,18 @@ static int cmd_sample(int argc, char **argv)
         prompt_tokens = malloc(sizeof(int));
         prompt_tokens[0] = tok.eot_token;
     } else {
-        /* Naive byte-level encoding: each byte is a token.
-         * Works correctly only with byte-level tokenizers.
-         * For GPT-2 BPE the proper encoder is in Python (export_weights.py). */
-        prompt_len = (int)strlen(prompt_str);
-        prompt_tokens = malloc((size_t)prompt_len * sizeof(int));
-        for (int i = 0; i < prompt_len; i++)
-            prompt_tokens[i] = (unsigned char)prompt_str[i];
+        /* NOTE: GPT-2 BPE tokenization requires Python (tiktoken).
+         * Pass pre-tokenized integer IDs separated by commas instead:
+         *   cngpt sample --weights=... --prompt="50256,13"   (EOT + ".")
+         * Or omit --prompt to start from <|endoftext|> (token 50256).
+         * A future utility (scripts/encode_prompt.py) will tokenize strings. */
+        fprintf(stderr, "Warning: --prompt text is interpreted as "
+                "comma-separated BPE token IDs, not raw text.\n"
+                "Omit --prompt to start from <|endoftext|>.\n");
+        /* Fall back to EOT token */
+        prompt_len = 1;
+        prompt_tokens = malloc(sizeof(int));
+        prompt_tokens[0] = tok.eot_token;
     }
 
     int total = prompt_len + new_tokens;
