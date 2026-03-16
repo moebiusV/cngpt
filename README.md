@@ -261,10 +261,17 @@ cngpt sample --weights=<file> [options]
 Without `--vocab`, token ids are printed as `[N]`. With the vocab file exported
 by `export_weights.py`, GPT-2 byte-pair encodings are decoded to Unicode.
 
-**Note on prompts**: GPT-2 BPE tokenization requires Python. The C binary
-starts generation from token 50256 (`<|endoftext|>`), which signals the
-beginning of a new document. To start from a specific context, pre-tokenize
-with `tiktoken` in Python and pass the resulting integer ids.
+**Prompts require BPE tokenization**: The C binary cannot tokenize raw text.
+Use `scripts/encode_prompt.py` to convert text to token IDs:
+
+```sh
+PROMPT=$(python3 scripts/encode_prompt.py "KING HENRY:")
+./cngpt sample --weights=shakespeare.bin --prompt="$PROMPT" --tokens=200 \
+               --temp=0.8 --topk=40 --vocab=gpt2.vocab.txt
+```
+
+Without `--prompt`, generation starts from `<|endoftext|>` (token 50256),
+which is the correct BPE sequence start.
 
 ### bench
 
@@ -284,44 +291,38 @@ For a full compiler-flag sweep, see [Benchmark Harness](#benchmark-harness).
 
 ## Benchmark Harness
 
-`tests/bench.sh` compiles cngpt with 10 flag combinations, runs inference on
-each, and prints a comparison table:
+`tests/bench.sh` compiles cngpt with several flag combinations and prints a
+comparison table:
 
 ```sh
 tests/bench.sh --weights=gpt2.bin --iters=30 --seq=128
 ```
 
-Sample output (Ryzen 5 4500U, GCC 14.2):
+GPT-2 small inference (B=1, T=128) is **BLAS-dominated**: the 12 linear
+layers (each a 128×768→768 GEMM) take ~85% of wall time. The AVX2 kernels
+for LayerNorm, GELU, and Softmax improve the remaining ~15%.
+
+**Measured on AMD Ryzen 5 4500U (6C/6T), GCC 13.3, OpenBLAS 0.3.x:**
 
 ```
-=== Compiler Flag Benchmark (threads=1, seq=128, iters=30) ===
+flags                       tok/s    speedup
+--------------------------  -------  -------
+-O2  (scalar)               196.9     1.00x
+-O3 -march=native -ffast-math  224.3  1.14x
 
-FLAG_SET   |     tok/s |    ms/tok |    speedup
------------|-----------|-----------|------------
-BASE       |    1823.4 |   0.549ms |      1.00x
-OPT        |    2184.1 |   0.458ms |      1.20x
-FAST       |    2261.8 |   0.442ms |      1.24x
-NATIVE     |    2598.7 |   0.385ms |      1.43x
-FMA        |    2701.3 |   0.370ms |      1.48x
-MATH       |    3012.5 |   0.332ms |      1.65x
-UNROLL     |    3089.4 |   0.324ms |      1.69x
-LTO        |    3241.6 |   0.308ms |      1.78x
-FULL       |    3398.2 |   0.294ms |      1.86x
-PGO        |    3512.9 |   0.285ms |      1.93x
-
-=== OpenBLAS Thread Count Sweep (FULL flags, seq=128) ===
-
-THREADS      |     tok/s |    speedup
--------------|-----------|------------
-1            |    3398.2 |      1.00x
-2            |    4821.7 |      1.42x
-4            |    6103.4 |      1.80x
-6            |    6891.2 |      2.03x
-8            |    7012.8 |      2.06x
+OpenBLAS thread sweep (AVX2 build, batch=1 seq=128):
+  OPENBLAS_NUM_THREADS=1    250.2    1.00x
+  OPENBLAS_NUM_THREADS=2    242.6    0.97x  ← threading overhead dominates
+  OPENBLAS_NUM_THREADS=4    238.9    0.95x     for small batch=1 GEMMs
 ```
 
-The harness also performs a two-pass PGO build (profile-generate → inference
-run → profile-use) which consistently adds 5–10% on top of `FULL`.
+**Key observations:**
+- For batch=1 inference, `OPENBLAS_NUM_THREADS=1` is fastest. Small GEMMs
+  (128×768) don't amortize thread launch overhead.
+- Threading helps at larger batch sizes (B≥4) where each GEMM is bigger.
+- The speedup from AVX2 kernels (LayerNorm/GELU/Softmax) is modest here
+  because those ops represent <15% of total time at this batch/seq size.
+  At very short sequences (T=8–16) or larger C, the balance shifts.
 
 ---
 
