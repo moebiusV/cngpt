@@ -220,18 +220,26 @@ static int cmd_sample(int argc, char **argv)
         prompt_tokens = malloc(sizeof(int));
         prompt_tokens[0] = tok.eot_token;
     } else {
-        /* NOTE: GPT-2 BPE tokenization requires Python (tiktoken).
-         * Pass pre-tokenized integer IDs separated by commas instead:
-         *   cngpt sample --weights=... --prompt="50256,13"   (EOT + ".")
-         * Or omit --prompt to start from <|endoftext|> (token 50256).
-         * A future utility (scripts/encode_prompt.py) will tokenize strings. */
-        fprintf(stderr, "Warning: --prompt text is interpreted as "
-                "comma-separated BPE token IDs, not raw text.\n"
-                "Omit --prompt to start from <|endoftext|>.\n");
-        /* Fall back to EOT token */
+        /* Parse comma-separated BPE token IDs produced by encode_prompt.py.
+         * Example: --prompt="37286,367,1677,18276,25"  ("KING HENRY:")
+         * Use:  PROMPT=$(python3 scripts/encode_prompt.py "KING HENRY:")
+         *       cngpt sample --weights=... --prompt="$PROMPT" */
+        /* Count tokens: commas + 1 */
         prompt_len = 1;
-        prompt_tokens = malloc(sizeof(int));
-        prompt_tokens[0] = tok.eot_token;
+        for (const char *p = prompt_str; *p; p++)
+            if (*p == ',') prompt_len++;
+        prompt_tokens = malloc((size_t)prompt_len * sizeof(int));
+        if (!prompt_tokens) { gpt_free(&m); return 1; }
+        char *buf = strdup(prompt_str);
+        char *tok_save = NULL;
+        char *piece = strtok_r(buf, ",", &tok_save);
+        int idx = 0;
+        while (piece && idx < prompt_len) {
+            prompt_tokens[idx++] = atoi(piece);
+            piece = strtok_r(NULL, ",", &tok_save);
+        }
+        prompt_len = idx;
+        free(buf);
     }
 
     int total = prompt_len + new_tokens;
