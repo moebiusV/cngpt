@@ -11,6 +11,7 @@
 #define CNGPT_MODEL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* -----------------------------------------------------------------------
  * Weight file header (7 × int32)
@@ -130,7 +131,7 @@ typedef struct {
     /* AdamW optimizer state */
     float *m_buf;                 /* first moment,  same size as param_buf */
     float *v_buf;                 /* second moment, same size as param_buf */
-    float *decay_buf;             /* 1.0 = apply weight decay, 0.0 = skip (biases/LN) */
+    uint8_t *decay_buf;           /* 1 = apply weight decay, 0 = skip (biases/LN) */
     int    n_params;              /* total parameter count */
     int    step;                  /* optimizer step counter */
 } GPT;

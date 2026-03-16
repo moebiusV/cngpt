@@ -252,7 +252,7 @@ void cross_entropy_fwd(const float *logits, const int *targets,
         const float *lg = logits + bt * V;
         float       *pr = probs_out + bt * V;
 
-        /* softmax */
+        /* numerically-stable log-softmax + NLL for the target token */
         float mx = -FLT_MAX;
         for (int v = 0; v < V; v++)
             if (lg[v] > mx) mx = lg[v];
@@ -262,13 +262,14 @@ void cross_entropy_fwd(const float *logits, const int *targets,
             pr[v] = expf(lg[v] - mx);
             sum  += pr[v];
         }
+        float log_sum = logf(sum);   /* log Σ exp(lg - mx) */
         float inv = 1.0f / sum;
         for (int v = 0; v < V; v++)
             pr[v] *= inv;
 
-        /* NLL */
+        /* NLL = -(logit[tgt] - mx) + log_sum  (avoids log(small+eps)) */
         int tgt = targets[bt];
-        loss -= logf(pr[tgt] + 1e-10f);
+        loss -= (lg[tgt] - mx) - log_sum;
     }
     *loss_out = loss / (float)BT;
 }

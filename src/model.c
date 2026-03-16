@@ -132,7 +132,7 @@ int gpt_init(GPT *m, GPTConfig cfg)
     m->grad_buf  = calloc((size_t)m->n_params, sizeof(float));
     m->m_buf     = calloc((size_t)m->n_params, sizeof(float));
     m->v_buf     = calloc((size_t)m->n_params, sizeof(float));
-    m->decay_buf = calloc((size_t)m->n_params, sizeof(float));
+    m->decay_buf = calloc((size_t)m->n_params, sizeof(uint8_t));
 
     if (!m->param_buf || !m->grad_buf || !m->m_buf || !m->v_buf || !m->decay_buf)
         return -1;
@@ -147,27 +147,28 @@ int gpt_init(GPT *m, GPTConfig cfg)
      * Weight matrices (c_attn_w, c_proj_w, mlp_fc_w, mlp_proj_w) → decay. */
     {
         int C = cfg.n_embd, V = cfg.vocab_size, T = cfg.block_size;
-        float *d = m->decay_buf;
+        uint8_t *d = m->decay_buf;
         /* wte [V*C]: decay */
-        for (int i = 0; i < V*C; i++) *d++ = 1.0f;
+        memset(d, 1, (size_t)V*C); d += V*C;
         /* wpe [T*C]: decay */
-        for (int i = 0; i < T*C; i++) *d++ = 1.0f;
+        memset(d, 1, (size_t)T*C); d += T*C;
         for (int l = 0; l < L; l++) {
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln1_w: no decay */
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln1_b: no decay */
-            for (int i = 0; i < 3*C*C; i++) *d++ = 1.0f; /* c_attn_w: decay */
-            for (int i = 0; i < 3*C;   i++) *d++ = 0.0f; /* c_attn_b: no decay */
-            for (int i = 0; i < C*C;   i++) *d++ = 1.0f; /* c_proj_w: decay */
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* c_proj_b: no decay */
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln2_w: no decay */
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln2_b: no decay */
-            for (int i = 0; i < 4*C*C; i++) *d++ = 1.0f; /* mlp_fc_w: decay */
-            for (int i = 0; i < 4*C;   i++) *d++ = 0.0f; /* mlp_fc_b: no decay */
-            for (int i = 0; i < C*4*C; i++) *d++ = 1.0f; /* mlp_proj_w: decay */
-            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* mlp_proj_b: no decay */
+            memset(d, 0, (size_t)C);     d += C;     /* ln1_w: no decay */
+            memset(d, 0, (size_t)C);     d += C;     /* ln1_b: no decay */
+            memset(d, 1, (size_t)3*C*C); d += 3*C*C; /* c_attn_w: decay */
+            memset(d, 0, (size_t)3*C);   d += 3*C;   /* c_attn_b: no decay */
+            memset(d, 1, (size_t)C*C);   d += C*C;   /* c_proj_w: decay */
+            memset(d, 0, (size_t)C);     d += C;     /* c_proj_b: no decay */
+            memset(d, 0, (size_t)C);     d += C;     /* ln2_w: no decay */
+            memset(d, 0, (size_t)C);     d += C;     /* ln2_b: no decay */
+            memset(d, 1, (size_t)4*C*C); d += 4*C*C; /* mlp_fc_w: decay */
+            memset(d, 0, (size_t)4*C);   d += 4*C;   /* mlp_fc_b: no decay */
+            memset(d, 1, (size_t)C*4*C); d += C*4*C; /* mlp_proj_w: decay */
+            memset(d, 0, (size_t)C);     d += C;     /* mlp_proj_b: no decay */
         }
-        for (int i = 0; i < C; i++) *d++ = 0.0f; /* ln_f_w: no decay */
-        for (int i = 0; i < C; i++) *d++ = 0.0f; /* ln_f_b: no decay */
+        memset(d, 0, (size_t)C); d += C; /* ln_f_w: no decay */
+        memset(d, 0, (size_t)C); d += C; /* ln_f_b: no decay */
+        (void)d;
     }
 
     return 0;
@@ -912,9 +913,8 @@ void gpt_adamw(GPT *m, float lr, float beta1, float beta2,
         float v_hat = m->v_buf[i] / bc2;
 
         /* AdamW: weight decay only for 2D params (weight matrices, embeddings).
-         * Biases and LayerNorm parameters use decay_buf[i] == 0.0, so
-         * effectively wd=0 for those. decay_buf[i] == 1.0 for weight matrices. */
-        float effective_wd = wd * m->decay_buf[i];
+         * decay_buf[i]==1 for those; 0 for biases/LN. */
+        float effective_wd = m->decay_buf[i] ? wd : 0.0f;
         m->param_buf[i] = m->param_buf[i] * (1.0f - lr * effective_wd)
                         - lr * m_hat / (sqrtf(v_hat) + eps);
     }
