@@ -111,14 +111,19 @@ python3 scripts/export_weights.py --model=gpt2 --out=gpt2.bin
 
 ### Build commands
 
+The `configure` script is checked into the repository, so you do not need
+autoconf/automake installed unless you edit `configure.ac` or `Makefile.am`.
+
 ```sh
-autoreconf -fi          # generate configure script (one-time)
 ./configure             # detect compiler + BLAS paths
 make -j$(nproc)         # compile everything
 make check              # run numerical unit tests
 sudo make install       # install to /usr/local/{bin,share/man/man1}
 sudo make uninstall     # reverse installation
 make dist               # create release tarball
+
+# Only needed if you modify configure.ac or Makefile.am:
+autoreconf -fi && ./configure
 ```
 
 ### Custom BLAS location
@@ -171,17 +176,30 @@ cngpt expects a flat binary file of `uint16_t` token ids (no header). The
 [nanoGPT repository](https://github.com/karpathy/nanoGPT) provides `prepare.py` scripts for
 common datasets that produce exactly this format.
 
-### Shakespeare (character-level, ~1 MB)
+### Shakespeare (~1 MB, GPT-2 BPE tokenization)
 
 ```sh
-git clone https://github.com/karpathy/nanoGPT
-cd nanoGPT
-python3 data/shakespeare_char/prepare.py
-# Produces: data/shakespeare_char/train.bin, data/shakespeare_char/val.bin
+# Install tiktoken for GPT-2 BPE tokenization
+pip install tiktoken requests
 
-cngpt train --data=data/shakespeare_char --weights=gpt2.bin \
-            --out=shakespeare.bin --iters=2000 --batch=2 --seq=256
+python3 scripts/prepare_shakespeare.py
+# Downloads input.txt from Karpathy's repo (1 MB) and tokenizes with GPT-2 BPE
+# Produces: data/shakespeare/train.bin (~304K tokens), data/shakespeare/val.bin
+
+# Fine-tune from GPT-2 pretrained weights (CPU-friendly settings)
+cngpt train --data=data/shakespeare --weights=gpt2.bin \
+            --out=shakespeare.bin --iters=500 \
+            --batch=1 --seq=128 --lr=3e-4 --warmup=50
 ```
+
+**CPU training notes**: GPT-2 small stores ~2 GB of parameter buffers (params +
+grads + Adam m/v). Practical settings for a machine with 4 GB RAM:
+- `--batch=1 --seq=128`: ~3.5 s/iter → 500 iters in ~30 min
+- `--batch=1 --seq=256`: ~7 s/iter → requires ~2.5 GB RAM for activations
+- `--batch=2 --seq=256`: ~14 s/iter → requires ~2.8 GB free
+
+For context: Python nanoGPT with `--batch=12 --seq=1024` on an A100 GPU runs
+at ~0.1 s/iter.
 
 ### OpenWebText (~40 GB)
 
@@ -368,7 +386,7 @@ tokens [B, T]
 
 ### Backward pass
 
-`gpt_backward_full()` is a manual reverse of every operation above. Key points:
+`gpt_backward()` is a manual reverse of every operation above. Key points:
 
 - Gradient flows through two residual paths simultaneously (attention path +
   MLP path both feed back to the same input `x`).
@@ -467,9 +485,11 @@ cngpt/
    count. For batch=1 inference, 1–4 threads is usually optimal (diminishing
    returns at higher counts due to overhead).
 
-3. **Batch size**: Training throughput scales well with batch size up to the
-   point where the L3 cache fills. On a laptop CPU (6–8 MB L3), batch=4–8
-   with seq=256 is a good starting point.
+3. **Memory and batch size**: cngpt stores all activations for the backward pass
+   (no gradient checkpointing). For GPT-2 small, the parameter buffers alone
+   (params + grads + Adam m/v) occupy ~2 GB. On a machine with 4–8 GB RAM,
+   use `--batch=1 --seq=128` to `--batch=2 --seq=256`. The default `--batch=4
+   --seq=1024` requires roughly 17 GB and is intended for GPU-style runs.
 
 4. **Sequence length**: Forward pass compute is O(T²·C) per layer (attention)
    + O(T·C²) (linear layers). For training, shorter sequences (256–512) with
@@ -482,27 +502,79 @@ cngpt/
 
 ## Verification
 
-### Unit tests
+### Ops unit tests
 
 ```sh
-make check
+make check          # runs check_ops and check_grad
 ```
 
-Runs `tests/check_ops` which verifies:
-- `linear_fwd`: Y = X·Wᵀ + b against known values
-- `linear_bwd_dx`: gradient w.r.t. input
-- `layernorm_fwd`: mean/variance normalization, zero-mean output
-- `gelu_fwd`: spot-checks against reference values (0, 1, −1, 2)
-- `softmax_inplace`: row sums to 1, numerical stability with large logits
-- `cross_entropy_fwd`: near-zero loss on correct class, high loss on wrong class
-- `layernorm_bwd`: numerical gradient check (finite differences)
+`tests/check_ops` verifies each primitive against known values:
+- `linear_fwd`: Y = X·Wᵀ + b
+- `layernorm_fwd`: mean/variance normalization
+- `gelu_fwd`: spot-checks (0, 1, −1, 2)
+- `softmax_inplace`: rows sum to 1; numerical stability with large inputs
+- `cross_entropy_fwd`: near-zero loss on correct class, high on wrong class
+- `layernorm_bwd`: numerical gradient check
 
-### Loss comparison with Python nanoGPT
+### Gradient check
 
-To verify the training loop is numerically correct, compare loss curves on
-the Shakespeare dataset between Python nanoGPT and cngpt starting from the
-same checkpoint. The first few hundred steps should agree to within floating-point
-noise (~1e-4 relative difference).
+`tests/check_grad` runs a central-difference numerical gradient check over
+all 2752 sampled parameters of a tiny (2L/4H/32C) model:
+
+```
+Gradient check — tiny GPT (2L/4H/32C V=64 T=8 B=2 seq=6)
+
+Forward loss: 4.144138
+
+2752 passed, 0 failed
+```
+
+This covers wte, wpe, all LN/attention/MLP weights and biases in both layers.
+
+### Forward pass verification (GPT-2)
+
+```sh
+# Export weights, then:
+source .venv/bin/activate
+python3 scripts/verify_forward.py --weights=gpt2.bin --seq=64
+```
+
+Compiles a minimal C driver that calls `gpt_forward`, dumps logits to stdout,
+and compares against a PyTorch float32 reference (or numpy fallback):
+
+```
+Loading gpt2.bin...
+  n_layer=12 n_head=12 n_embd=768 vocab=50257 block=1024
+  Testing: B=1 T=64 seed=42
+
+Running numpy reference forward pass...
+  loss_numpy  = 13.13832961
+Running PyTorch reference forward pass...
+  loss_torch  = 13.13832569
+Compiling and running cngpt forward pass...
+  loss_cngpt  = 13.13830280
+
+============================================================
+                    Verification Results
+============================================================
+  (reference: torch)
+
+Loss:
+  torch  : 13.13832569
+  cngpt  : 13.13830280
+  |diff| : 2.29e-05  PASS
+
+Logits [1×64×50257]:
+  max |diff|  : 1.98e-04  PASS
+  mean |diff| : 2.33e-05
+
+============================================================
+ALL CHECKS PASSED
+```
+
+The logit tolerance is 5e-4 (default). A 12-layer float32 forward pass
+through OpenBLAS and PyTorch's cuBLAS/MKL backends accumulates ~2e-4 of
+rounding difference — this is expected float32 precision at this depth.
 
 ---
 
