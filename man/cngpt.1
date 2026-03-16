@@ -1,0 +1,236 @@
+.TH CNGPT 1 "2026-03-16" "cngpt 0.1.0" "User Commands"
+.SH NAME
+cngpt \- nanoGPT in C with OpenBLAS acceleration
+.SH SYNOPSIS
+.B cngpt train
+.RI [ options ]
+.B \-\-data= DIR
+.B \-\-weights= FILE
+.br
+.B cngpt sample
+.RI [ options ]
+.B \-\-weights= FILE
+.br
+.B cngpt bench
+.RI [ options ]
+.B \-\-weights= FILE
+.SH DESCRIPTION
+.B cngpt
+is a C implementation of nanoGPT (Andrej Karpathy) using OpenBLAS for
+matrix operations.
+It supports full training from a pre-tokenized binary dataset, autoregressive
+text generation, and a compiler-flag benchmark harness.
+.PP
+Model architecture matches GPT-2: transformer blocks with multi-head
+causal self-attention, GELU activations, and weight-tied output projection.
+Supported scales: gpt2 (117M), gpt2-medium (345M), gpt2-large (762M),
+gpt2-xl (1.5B).
+.SH SUBCOMMANDS
+.SS train
+Train (or fine-tune) a model on pre-tokenized data.
+.PP
+The data directory must contain a file named
+.B train.bin
+with tokens stored as uint16_t in row-major order (produced by a tokenizer
+script such as those from the nanoGPT repository).
+.SS sample
+Generate text autoregressively from a loaded checkpoint.
+Sampling uses temperature scaling and optional top-k filtering.
+.SS bench
+Run a fixed number of inference forward passes and report throughput
+(tokens/second, ms/token).
+For a full compiler-flag sweep, use
+.B tests/bench.sh
+directly.
+.SH OPTIONS
+.SS Common
+.TP
+.BI \-\-weights= FILE
+Path to weight file in cngpt binary format.
+For
+.B train
+this is the starting checkpoint (or a freshly exported HuggingFace model).
+.SS train
+.TP
+.BI \-\-data= DIR
+Directory containing
+.IR train.bin .
+.TP
+.BI \-\-out= FILE
+Checkpoint output file (default:
+.IR checkpoint.bin ).
+Intermediate checkpoints are written as
+.IR FILE . N
+every
+.B \-\-save-every
+steps.
+.TP
+.BI \-\-iters= N
+Number of gradient update steps (default: 5000).
+.TP
+.BI \-\-batch= B
+Batch size (default: 4).
+Reduce if GPU (or CPU RAM) is tight.
+.TP
+.BI \-\-seq= T
+Sequence length per example (default: 1024).
+Must not exceed the model's
+.I block_size
+(1024 for standard GPT-2).
+.TP
+.BI \-\-lr= LR
+Peak learning rate for cosine schedule with linear warmup (default: 3e\-4).
+.TP
+.BI \-\-lr\-min= LR
+Minimum learning rate at the end of cosine decay (default: 1e\-5).
+.TP
+.BI \-\-warmup= W
+Number of linear warmup steps (default: 100).
+.TP
+.BI \-\-dropout= D
+Dropout probability applied to embeddings and residual connections
+(default: 0.0 — no dropout).
+.TP
+.BI \-\-grad\-clip= G
+Global gradient norm clip threshold (default: 1.0).
+Set to 0 to disable.
+.TP
+.BI \-\-log\-every= N
+Print average loss every
+.I N
+steps (default: 10).
+.TP
+.BI \-\-save\-every= N
+Save intermediate checkpoint every
+.I N
+steps (default: 500).
+.SS sample
+.TP
+.BI \-\-prompt= TEXT
+Initial context string (default: begin from
+.IR <|endoftext|> ).
+Note: with GPT-2 BPE tokenization, proper encoding requires the Python
+vocabulary; without
+.B \-\-vocab
+the prompt is treated as raw bytes.
+.TP
+.BI \-\-tokens= N
+Number of new tokens to generate (default: 200).
+.TP
+.BI \-\-temp= F
+Softmax temperature.
+Values below 1.0 make output more deterministic; above 1.0 more random
+(default: 1.0).
+.TP
+.BI \-\-topk= K
+Top-k sampling: only the
+.I K
+highest-probability tokens are considered.
+0 disables top-k and samples from the full distribution (default: 40).
+.TP
+.BI \-\-vocab= FILE
+Path to vocabulary file (one token string per line, as exported by
+.IR scripts/export_weights.py ).
+Without this, token ids are printed directly.
+.SS bench
+.TP
+.BI \-\-iters= N
+Number of forward passes to time (default: 50).
+.TP
+.BI \-\-seq= T
+Sequence length for inference benchmark (default: 128).
+.SH WEIGHT FILE FORMAT
+The binary weight file starts with a 7 × int32 header:
+.PP
+.RS
+[magic=0x434E4750, version=1, n_layer, n_head, n_embd, vocab_size, block_size]
+.RE
+.PP
+Followed immediately by float32 tensors in the order documented in
+.BR model.h :
+.I wte, wpe,
+then for each layer:
+.IR ln1_w ", " ln1_b ", " c_attn_w ", " c_attn_b ", " c_proj_w ", " c_proj_b ", "
+.IR ln2_w ", " ln2_b ", " mlp_fc_w ", " mlp_fc_b ", " mlp_proj_w ", " mlp_proj_b ,
+then
+.IR ln_f_w ", " ln_f_b .
+.PP
+Use
+.B scripts/export_weights.py
+to generate this file from a HuggingFace GPT-2 checkpoint.
+.SH DATA FORMAT
+Training data is a flat binary file of uint16 token ids.
+The file is memory-mapped and read sequentially; it wraps at the end.
+.PP
+To prepare the Shakespeare dataset from the nanoGPT repository:
+.PP
+.RS
+.EX
+python3 nanoGPT/data/shakespeare_char/prepare.py
+# Produces train.bin / val.bin in that directory
+.EE
+.RE
+.SH EXAMPLES
+Export GPT-2 weights:
+.PP
+.RS
+.EX
+python3 scripts/export_weights.py --model=gpt2 --out=gpt2.bin
+.EE
+.RE
+.PP
+Sample from GPT-2:
+.PP
+.RS
+.EX
+cngpt sample --weights=gpt2.bin --prompt="Once upon a time" \\
+             --tokens=200 --temp=0.8 --topk=40 \\
+             --vocab=gpt2.vocab.txt
+.EE
+.RE
+.PP
+Fine-tune on Shakespeare for 1000 steps:
+.PP
+.RS
+.EX
+cngpt train --data=data/shakespeare_char \\
+            --weights=gpt2.bin --out=shakespeare.bin \\
+            --iters=1000 --batch=2 --seq=256
+.EE
+.RE
+.PP
+Run the compiler-flag benchmark:
+.PP
+.RS
+.EX
+tests/bench.sh --weights=gpt2.bin --iters=30 --seq=128
+.EE
+.RE
+.SH ENVIRONMENT
+.TP
+.B OPENBLAS_NUM_THREADS
+Controls the number of threads used by OpenBLAS.
+The benchmark harness sweeps values 1–8.
+.SH FILES
+.TP
+.I gpt2.bin
+Default weight file location (produced by
+.IR scripts/export_weights.py ).
+.TP
+.I gpt2.vocab.txt
+Vocabulary file produced alongside the weight export.
+.SH SEE ALSO
+The original nanoGPT repository by Andrej Karpathy:
+.I https://github.com/karpathy/nanoGPT
+.PP
+OpenBLAS documentation:
+.I https://www.openblas.net
+.SH AUTHORS
+See the
+.I AUTHORS
+file distributed with the source.
+.SH LICENSE
+MIT License.
+See the
+.I COPYING
+file distributed with the source.

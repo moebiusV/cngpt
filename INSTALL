@@ -1,0 +1,67 @@
+INSTALL — cngpt build and installation instructions
+
+QUICK START
+-----------
+
+  autoreconf -fi
+  ./configure
+  make
+  make check
+  sudo make install
+
+DEPENDENCIES
+------------
+
+Required:
+  - GCC (or compatible C11 compiler)
+  - GNU autoconf >= 2.69
+  - GNU automake >= 1.14
+  - libopenblas-dev (provides cblas.h and libopenblas.so)
+  - libm, libpthread (standard on Linux)
+
+On Debian/Ubuntu:
+  sudo apt-get install autoconf automake libopenblas-dev
+
+Optional (for weight export):
+  - Python 3.8+
+  - pip install torch transformers
+
+CONFIGURE OPTIONS
+-----------------
+
+  --prefix=DIR          Install files in DIR (default: /usr/local)
+  --with-blas-cflags=F  CFLAGS for BLAS headers (auto-detected on Debian)
+  --with-blas-libs=L    LIBS for BLAS linking (auto-detected on Debian)
+
+Example for a custom OpenBLAS installation:
+
+  ./configure \
+    BLAS_CFLAGS="-I/opt/OpenBLAS/include" \
+    BLAS_LIBS="-L/opt/OpenBLAS/lib -lopenblas"
+
+PERFORMANCE FLAGS
+-----------------
+
+For maximum inference speed on x86-64 with AVX2/FMA:
+
+  ./configure CFLAGS="-O3 -march=native -ffast-math -funroll-loops"
+  make
+
+See tests/bench.sh for an automated compiler-flag sweep.
+
+CROSS-COMPILATION
+-----------------
+
+  ./configure --host=aarch64-linux-gnu \
+    CC=aarch64-linux-gnu-gcc \
+    BLAS_CFLAGS="-I/path/to/aarch64/openblas/include" \
+    BLAS_LIBS="-L/path/to/aarch64/openblas/lib -lopenblas"
+
+INSTALLATION LOCATIONS
+----------------------
+
+  Binary:   $prefix/bin/cngpt
+  Manpage:  $prefix/share/man/man1/cngpt.1
+
+To uninstall:
+  sudo make uninstall

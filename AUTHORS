@@ -1,0 +1,9 @@
+cngpt is a C translation of nanoGPT by Andrej Karpathy
+(https://github.com/karpathy/nanoGPT).
+
+The architecture, training loop design, and AdamW hyperparameters follow
+nanoGPT closely. The weight file format, BLAS tensor primitives, and GNU
+packaging are original to this project.
+
+Maintainer:
+  David Mulryan

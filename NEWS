@@ -1,0 +1,15 @@
+cngpt NEWS — user-visible changes by release
+
+Version 0.1.0 (2026-03-16)
+  * Initial release.
+  * Full GPT-2 forward pass (12-layer / 768-embd / 12-head) in C with
+    OpenBLAS BLAS-3 matmuls.
+  * Manual backpropagation and AdamW optimizer with cosine LR schedule
+    and linear warmup.
+  * Autoregressive sampling with temperature and top-k filtering.
+  * mmap-based binary data loader (uint16 token ids).
+  * scripts/export_weights.py — HuggingFace GPT-2 → cngpt binary format.
+  * Compiler-flag benchmark harness (tests/bench.sh) sweeping BASE through
+    PGO + FULL, plus OpenBLAS thread count sweep.
+  * GNU autotools packaging (./configure && make && make install).
+  * Troff manpage (man/cngpt.1).

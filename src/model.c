@@ -1,0 +1,1005 @@
+/*
+ * model.c — GPT-2 model: forward, backward, AdamW
+ *
+ * MIT License — see COPYING
+ */
+
+#include "model.h"
+#include "ops.h"
+
+#include <cblas.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================
+ * Parameter counting helpers
+ * ============================================================ */
+
+int gpt_num_params(const GPTConfig *cfg)
+{
+    int C = cfg->n_embd;
+    int V = cfg->vocab_size;
+    int T = cfg->block_size;
+    int L = cfg->n_layer;
+
+    int n = V * C          /* wte */
+          + T * C;         /* wpe */
+
+    /* per layer */
+    n += L * (  C          /* ln1_w */
+              + C          /* ln1_b */
+              + 3*C * C    /* c_attn_w */
+              + 3*C        /* c_attn_b */
+              + C * C      /* c_proj_w */
+              + C          /* c_proj_b */
+              + C          /* ln2_w */
+              + C          /* ln2_b */
+              + 4*C * C    /* mlp_fc_w */
+              + 4*C        /* mlp_fc_b */
+              + C * 4*C    /* mlp_proj_w */
+              + C          /* mlp_proj_b */
+             );
+
+    n += C + C;            /* ln_f_w, ln_f_b */
+
+    return n;
+}
+
+/* ============================================================
+ * Assign weight pointers into a flat buffer
+ * ============================================================ */
+
+static void assign_weights(GPTWeights *w, float *buf,
+                           const GPTConfig *cfg)
+{
+    int C = cfg->n_embd;
+    int V = cfg->vocab_size;
+    int T = cfg->block_size;
+    int L = cfg->n_layer;
+    float *p = buf;
+
+    w->wte = p; p += V * C;
+    w->wpe = p; p += T * C;
+
+    for (int l = 0; l < L; l++) {
+        w->ln1_w[l]    = p; p += C;
+        w->ln1_b[l]    = p; p += C;
+        w->c_attn_w[l] = p; p += 3*C * C;
+        w->c_attn_b[l] = p; p += 3*C;
+        w->c_proj_w[l] = p; p += C * C;
+        w->c_proj_b[l] = p; p += C;
+        w->ln2_w[l]    = p; p += C;
+        w->ln2_b[l]    = p; p += C;
+        w->mlp_fc_w[l] = p; p += 4*C * C;
+        w->mlp_fc_b[l] = p; p += 4*C;
+        w->mlp_proj_w[l] = p; p += C * 4*C;
+        w->mlp_proj_b[l] = p; p += C;
+    }
+
+    w->ln_f_w = p; p += C;
+    w->ln_f_b = p; /* p += C; (last) */
+}
+
+static int alloc_weight_ptrs(GPTWeights *w, int L)
+{
+    w->ln1_w    = malloc(L * sizeof(float *));
+    w->ln1_b    = malloc(L * sizeof(float *));
+    w->c_attn_w = malloc(L * sizeof(float *));
+    w->c_attn_b = malloc(L * sizeof(float *));
+    w->c_proj_w = malloc(L * sizeof(float *));
+    w->c_proj_b = malloc(L * sizeof(float *));
+    w->ln2_w    = malloc(L * sizeof(float *));
+    w->ln2_b    = malloc(L * sizeof(float *));
+    w->mlp_fc_w = malloc(L * sizeof(float *));
+    w->mlp_fc_b = malloc(L * sizeof(float *));
+    w->mlp_proj_w = malloc(L * sizeof(float *));
+    w->mlp_proj_b = malloc(L * sizeof(float *));
+
+    return (w->ln1_w && w->ln1_b && w->c_attn_w && w->c_attn_b &&
+            w->c_proj_w && w->c_proj_b && w->ln2_w && w->ln2_b &&
+            w->mlp_fc_w && w->mlp_fc_b && w->mlp_proj_w && w->mlp_proj_b)
+           ? 0 : -1;
+}
+
+static void free_weight_ptrs(GPTWeights *w)
+{
+    free(w->ln1_w);    free(w->ln1_b);
+    free(w->c_attn_w); free(w->c_attn_b);
+    free(w->c_proj_w); free(w->c_proj_b);
+    free(w->ln2_w);    free(w->ln2_b);
+    free(w->mlp_fc_w); free(w->mlp_fc_b);
+    free(w->mlp_proj_w); free(w->mlp_proj_b);
+}
+
+/* ============================================================
+ * Init / load / save / free
+ * ============================================================ */
+
+int gpt_init(GPT *m, GPTConfig cfg)
+{
+    memset(m, 0, sizeof(*m));
+    m->cfg = cfg;
+    int L = cfg.n_layer;
+
+    if (alloc_weight_ptrs(&m->params, L) != 0) return -1;
+    if (alloc_weight_ptrs(&m->grads, L) != 0)  return -1;
+
+    m->n_params = gpt_num_params(&cfg);
+
+    m->param_buf = calloc((size_t)m->n_params, sizeof(float));
+    m->grad_buf  = calloc((size_t)m->n_params, sizeof(float));
+    m->m_buf     = calloc((size_t)m->n_params, sizeof(float));
+    m->v_buf     = calloc((size_t)m->n_params, sizeof(float));
+
+    if (!m->param_buf || !m->grad_buf || !m->m_buf || !m->v_buf)
+        return -1;
+
+    assign_weights(&m->params, m->param_buf, &cfg);
+    assign_weights(&m->grads,  m->grad_buf,  &cfg);
+
+    return 0;
+}
+
+int gpt_load(GPT *m, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+
+    GPTHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fprintf(stderr, "gpt_load: short header\n"); fclose(f); return -1;
+    }
+    if (hdr.magic != CNGPT_MAGIC) {
+        fprintf(stderr, "gpt_load: bad magic 0x%X\n", hdr.magic);
+        fclose(f); return -1;
+    }
+
+    /* If model not yet initialized with matching config, do it now */
+    if (m->param_buf == NULL) {
+        GPTConfig cfg = {
+            .n_layer    = hdr.n_layer,
+            .n_head     = hdr.n_head,
+            .n_embd     = hdr.n_embd,
+            .vocab_size = hdr.vocab_size,
+            .block_size = hdr.block_size,
+            .dropout    = 0.0f,
+        };
+        if (gpt_init(m, cfg) != 0) { fclose(f); return -1; }
+    }
+
+    size_t n = (size_t)m->n_params;
+    if (fread(m->param_buf, sizeof(float), n, f) != n) {
+        fprintf(stderr, "gpt_load: short param data\n");
+        fclose(f); return -1;
+    }
+    fclose(f);
+    return 0;
+}
+
+int gpt_save(GPT *m, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return -1; }
+
+    GPTHeader hdr = {
+        .magic      = CNGPT_MAGIC,
+        .version    = CNGPT_VERSION,
+        .n_layer    = m->cfg.n_layer,
+        .n_head     = m->cfg.n_head,
+        .n_embd     = m->cfg.n_embd,
+        .vocab_size = m->cfg.vocab_size,
+        .block_size = m->cfg.block_size,
+    };
+    fwrite(&hdr, sizeof(hdr), 1, f);
+    fwrite(m->param_buf, sizeof(float), (size_t)m->n_params, f);
+    fclose(f);
+    return 0;
+}
+
+void gpt_free(GPT *m)
+{
+    free(m->param_buf);
+    free(m->grad_buf);
+    free(m->m_buf);
+    free(m->v_buf);
+    free(m->act_buf);
+    free(m->mask_buf);
+
+    free_weight_ptrs(&m->params);
+    free_weight_ptrs(&m->grads);
+
+    int L = m->cfg.n_layer;
+    if (L > 0 && m->acts.ln1_out) {
+        free(m->acts.ln1_out);    free(m->acts.ln1_mean);   free(m->acts.ln1_rstd);
+        free(m->acts.qkv);
+        free(m->acts.attn_scores); free(m->acts.attn_probs);
+        free(m->acts.attn_out);   free(m->acts.attn_proj);
+        free(m->acts.res1);
+        free(m->acts.ln2_out);    free(m->acts.ln2_mean);   free(m->acts.ln2_rstd);
+        free(m->acts.mlp_fc_out); free(m->acts.mlp_gelu);
+        free(m->acts.mlp_proj_out); free(m->acts.res2);
+        free(m->acts.res1_mask);  free(m->acts.res2_mask);
+    }
+    memset(m, 0, sizeof(*m));
+}
+
+/* ============================================================
+ * Activation buffer management
+ * ============================================================ */
+
+int gpt_resize_acts(GPT *m, int B, int T)
+{
+    int C  = m->cfg.n_embd;
+    int V  = m->cfg.vocab_size;
+    int L  = m->cfg.n_layer;
+    int H  = m->cfg.n_head;
+
+    /* Total floats needed */
+    size_t per_layer =
+          (size_t)B*T*C       /* ln1_out */
+        + (size_t)B*T         /* ln1_mean */
+        + (size_t)B*T         /* ln1_rstd */
+        + (size_t)B*T*3*C     /* qkv */
+        + (size_t)B*H*T*T     /* attn_scores */
+        + (size_t)B*H*T*T     /* attn_probs */
+        + (size_t)B*T*C       /* attn_out */
+        + (size_t)B*T*C       /* attn_proj */
+        + (size_t)B*T*C       /* res1 */
+        + (size_t)B*T*C       /* ln2_out */
+        + (size_t)B*T         /* ln2_mean */
+        + (size_t)B*T         /* ln2_rstd */
+        + (size_t)B*T*4*C     /* mlp_fc_out */
+        + (size_t)B*T*4*C     /* mlp_gelu */
+        + (size_t)B*T*C       /* mlp_proj_out */
+        + (size_t)B*T*C;      /* res2 */
+
+    size_t total =
+          (size_t)B*T*C       /* emb */
+        + per_layer * (size_t)L
+        + (size_t)B*T*C       /* ln_f_out */
+        + (size_t)B*T         /* ln_f_mean */
+        + (size_t)B*T         /* ln_f_rstd */
+        + (size_t)B*T*V       /* logits */
+        + (size_t)B*T*V;      /* probs */
+
+    size_t mask_total =
+          (size_t)B*T*C       /* emb_mask */
+        + (size_t)B*T*C * (size_t)L   /* res1_mask */
+        + (size_t)B*T*C * (size_t)L;  /* res2_mask */
+
+    free(m->act_buf);
+    free(m->mask_buf);
+    m->act_buf  = calloc(total, sizeof(float));
+    m->mask_buf = calloc(mask_total, sizeof(unsigned char));
+    if (!m->act_buf || !m->mask_buf) return -1;
+
+    /* Allocate pointer arrays if not yet done */
+    if (!m->acts.ln1_out) {
+        m->acts.ln1_out     = malloc(L * sizeof(float *));
+        m->acts.ln1_mean    = malloc(L * sizeof(float *));
+        m->acts.ln1_rstd    = malloc(L * sizeof(float *));
+        m->acts.qkv         = malloc(L * sizeof(float *));
+        m->acts.attn_scores = malloc(L * sizeof(float *));
+        m->acts.attn_probs  = malloc(L * sizeof(float *));
+        m->acts.attn_out    = malloc(L * sizeof(float *));
+        m->acts.attn_proj   = malloc(L * sizeof(float *));
+        m->acts.res1        = malloc(L * sizeof(float *));
+        m->acts.ln2_out     = malloc(L * sizeof(float *));
+        m->acts.ln2_mean    = malloc(L * sizeof(float *));
+        m->acts.ln2_rstd    = malloc(L * sizeof(float *));
+        m->acts.mlp_fc_out  = malloc(L * sizeof(float *));
+        m->acts.mlp_gelu    = malloc(L * sizeof(float *));
+        m->acts.mlp_proj_out= malloc(L * sizeof(float *));
+        m->acts.res2        = malloc(L * sizeof(float *));
+        m->acts.res1_mask   = malloc(L * sizeof(unsigned char *));
+        m->acts.res2_mask   = malloc(L * sizeof(unsigned char *));
+    }
+
+    /* Assign pointers */
+    float *p = m->act_buf;
+    unsigned char *mp = m->mask_buf;
+
+    m->acts.emb      = p; p += B*T*C;
+    m->acts.emb_mask = mp; mp += B*T*C;
+
+    for (int l = 0; l < L; l++) {
+        m->acts.ln1_out[l]      = p; p += B*T*C;
+        m->acts.ln1_mean[l]     = p; p += B*T;
+        m->acts.ln1_rstd[l]     = p; p += B*T;
+        m->acts.qkv[l]          = p; p += B*T*3*C;
+        m->acts.attn_scores[l]  = p; p += B*H*T*T;
+        m->acts.attn_probs[l]   = p; p += B*H*T*T;
+        m->acts.attn_out[l]     = p; p += B*T*C;
+        m->acts.attn_proj[l]    = p; p += B*T*C;
+        m->acts.res1[l]         = p; p += B*T*C;
+        m->acts.ln2_out[l]      = p; p += B*T*C;
+        m->acts.ln2_mean[l]     = p; p += B*T;
+        m->acts.ln2_rstd[l]     = p; p += B*T;
+        m->acts.mlp_fc_out[l]   = p; p += B*T*4*C;
+        m->acts.mlp_gelu[l]     = p; p += B*T*4*C;
+        m->acts.mlp_proj_out[l] = p; p += B*T*C;
+        m->acts.res2[l]         = p; p += B*T*C;
+        m->acts.res1_mask[l]    = mp; mp += B*T*C;
+        m->acts.res2_mask[l]    = mp; mp += B*T*C;
+    }
+
+    m->acts.ln_f_out  = p; p += B*T*C;
+    m->acts.ln_f_mean = p; p += B*T;
+    m->acts.ln_f_rstd = p; p += B*T;
+    m->acts.logits    = p; p += B*T*V;
+    m->acts.probs     = p;
+
+    return 0;
+}
+
+/* ============================================================
+ * Forward pass
+ * ============================================================ */
+
+float gpt_forward(GPT *m, const int *tokens, const int *targets,
+                  int B, int T)
+{
+    int C  = m->cfg.n_embd;
+    int V  = m->cfg.vocab_size;
+    int L  = m->cfg.n_layer;
+    int H  = m->cfg.n_head;
+    int hs = C / H;
+    int training = (targets != NULL && m->cfg.dropout > 0.0f);
+
+    if (gpt_resize_acts(m, B, T) != 0) {
+        fprintf(stderr, "gpt_forward: act alloc failed\n");
+        return 0.0f;
+    }
+
+    /* --------------------------------------------------
+     * 1. Token + positional embeddings
+     * -------------------------------------------------- */
+    float *emb = m->acts.emb;
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            int tok = tokens[b * T + t];
+            float *dst = emb + (b * T + t) * C;
+            const float *wte_row = m->params.wte + tok * C;
+            const float *wpe_row = m->params.wpe + t * C;
+            for (int c = 0; c < C; c++)
+                dst[c] = wte_row[c] + wpe_row[c];
+        }
+    }
+    if (training)
+        dropout_fwd(emb, m->acts.emb_mask, B*T*C, m->cfg.dropout);
+
+    /* Previous block's output; initially the embedding */
+    float *x = emb;
+
+    /* --------------------------------------------------
+     * 2. Transformer blocks
+     * -------------------------------------------------- */
+    for (int l = 0; l < L; l++) {
+        /* --- LayerNorm 1 --- */
+        layernorm_fwd(x, m->params.ln1_w[l], m->params.ln1_b[l],
+                      m->acts.ln1_out[l],
+                      m->acts.ln1_mean[l], m->acts.ln1_rstd[l],
+                      B*T, C);
+
+        /* --- QKV projection --- */
+        /* qkv [B*T, 3C] = ln1_out [B*T, C] · c_attn_wᵀ + c_attn_b */
+        linear_fwd(m->acts.ln1_out[l], m->params.c_attn_w[l],
+                   m->params.c_attn_b[l],
+                   m->acts.qkv[l], B*T, C, 3*C);
+
+        /* --- Scaled dot-product attention ---
+         * Split qkv into Q,K,V per head.
+         * We treat each head as a separate "batch" for BLAS:
+         *   Q [B*H, T, hs], K [B*H, T, hs], V [B*H, T, hs]
+         * These are NOT contiguous in memory after the split,
+         * so we use a strided copy into separate scratch in attn_out
+         * (reused as scratch before being overwritten).
+         */
+
+        /* Reinterpret qkv as [B, T, H, 3, hs] and transpose to
+         * Q [B, H, T, hs]  etc. by pointer arithmetic in the inner loop */
+        float *qkv = m->acts.qkv[l];
+
+        /* attn_scores [B*H, T, T] */
+        /* We'll loop over b and h to call BLAS per head */
+        float *scores = m->acts.attn_scores[l];
+        float *probs  = m->acts.attn_probs[l];
+        float *aout   = m->acts.attn_out[l];  /* [B, T, C] */
+
+        float scale = 1.0f / sqrtf((float)hs);
+
+        for (int b = 0; b < B; b++) {
+            for (int h = 0; h < H; h++) {
+                /* Q [T, hs]: qkv[b, t, h*hs .. (h+1)*hs] */
+                /* stride from one t to next = 3*C */
+                float *bh_scores = scores + (b*H + h) * T*T;
+                float *bh_probs  = probs  + (b*H + h) * T*T;
+
+                /* cblas_sgemm requires contiguous rows; Q,K,V are interleaved
+                 * in qkv [B, T, 3C], so we copy each head's slice to heap. */
+                float *Qh = malloc((size_t)T * hs * sizeof(float));
+                float *Kh = malloc((size_t)T * hs * sizeof(float));
+                float *Vh = malloc((size_t)T * hs * sizeof(float));
+
+                for (int t = 0; t < T; t++) {
+                    const float *row = qkv + (b*T + t) * 3*C;
+                    memcpy(Qh + t*hs, row + h*hs,       hs * sizeof(float));
+                    memcpy(Kh + t*hs, row + C + h*hs,   hs * sizeof(float));
+                    memcpy(Vh + t*hs, row + 2*C + h*hs, hs * sizeof(float));
+                }
+
+                /* scores [T,T] = Q [T,hs] · Kᵀ [hs,T] */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            T, T, hs,
+                            scale, Qh, hs, Kh, hs,
+                            0.0f, bh_scores, T);
+
+                /* causal mask */
+                causal_mask(bh_scores, T);
+
+                /* softmax → probs */
+                memcpy(bh_probs, bh_scores, T*T * sizeof(float));
+                softmax_inplace(bh_probs, T, T);
+
+                /* out [T,hs] = probs [T,T] · V [T,hs] */
+                /* Again need contiguous scratch */
+                float *out_h = malloc((size_t)T * hs * sizeof(float));
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            T, hs, T,
+                            1.0f, bh_probs, T, Vh, hs,
+                            0.0f, out_h, hs);
+
+                /* scatter back with stride C */
+                for (int t = 0; t < T; t++)
+                    memcpy(aout + (b*T + t)*C + h*hs,
+                           out_h + t*hs,
+                           hs * sizeof(float));
+
+                free(Qh); free(Kh); free(Vh); free(out_h);
+            }
+        }
+
+        /* --- Attention output projection --- */
+        linear_fwd(aout, m->params.c_proj_w[l], m->params.c_proj_b[l],
+                   m->acts.attn_proj[l], B*T, C, C);
+
+        /* --- Residual 1: res1 = x + attn_proj --- */
+        memcpy(m->acts.res1[l], x, B*T*C * sizeof(float));
+        residual_add(m->acts.res1[l], m->acts.attn_proj[l], B*T*C);
+        if (training)
+            dropout_fwd(m->acts.res1[l], m->acts.res1_mask[l],
+                        B*T*C, m->cfg.dropout);
+
+        /* --- LayerNorm 2 --- */
+        layernorm_fwd(m->acts.res1[l],
+                      m->params.ln2_w[l], m->params.ln2_b[l],
+                      m->acts.ln2_out[l],
+                      m->acts.ln2_mean[l], m->acts.ln2_rstd[l],
+                      B*T, C);
+
+        /* --- MLP: fc → gelu → proj --- */
+        linear_fwd(m->acts.ln2_out[l],
+                   m->params.mlp_fc_w[l], m->params.mlp_fc_b[l],
+                   m->acts.mlp_fc_out[l], B*T, C, 4*C);
+
+        gelu_fwd(m->acts.mlp_fc_out[l], m->acts.mlp_gelu[l], B*T*4*C);
+
+        linear_fwd(m->acts.mlp_gelu[l],
+                   m->params.mlp_proj_w[l], m->params.mlp_proj_b[l],
+                   m->acts.mlp_proj_out[l], B*T, 4*C, C);
+
+        /* --- Residual 2: res2 = res1 + mlp_proj --- */
+        memcpy(m->acts.res2[l], m->acts.res1[l], B*T*C * sizeof(float));
+        residual_add(m->acts.res2[l], m->acts.mlp_proj_out[l], B*T*C);
+        if (training)
+            dropout_fwd(m->acts.res2[l], m->acts.res2_mask[l],
+                        B*T*C, m->cfg.dropout);
+
+        x = m->acts.res2[l];
+    }
+
+    /* --------------------------------------------------
+     * 3. Final LayerNorm + lm_head
+     * -------------------------------------------------- */
+    layernorm_fwd(x, m->params.ln_f_w, m->params.ln_f_b,
+                  m->acts.ln_f_out,
+                  m->acts.ln_f_mean, m->acts.ln_f_rstd,
+                  B*T, C);
+
+    /* logits [B*T, V] = ln_f_out [B*T, C] · wteᵀ [C, V]  (weight-tied) */
+    linear_fwd(m->acts.ln_f_out, m->params.wte, NULL,
+               m->acts.logits, B*T, C, V);
+
+    /* --------------------------------------------------
+     * 4. Loss (training)
+     * -------------------------------------------------- */
+    if (targets == NULL) return 0.0f;
+
+    float loss;
+    cross_entropy_fwd(m->acts.logits, targets,
+                      m->acts.probs, &loss, B, T, V);
+    return loss;
+}
+
+/* ============================================================
+ * Backward pass
+ * ============================================================ */
+
+void gpt_backward(GPT *m __attribute__((unused)))
+{
+    /* We need the last batch size/T inferred from act_buf sizes.
+     * Instead, store them: we track them as a convenience via the
+     * fact that act_buf was allocated for these dimensions.
+     * For simplicity let's reuse the last forward call's B and T
+     * by reading from the activation pointer offsets — actually
+     * the cleanest approach is to store B and T on the struct.
+     * We'll add them as fields implicitly via a simple heuristic:
+     * just pass in the sizes. But gpt_backward takes no args, so
+     * we need to store them. Let's use a simple approach: store
+     * last_B, last_T in the GPT struct via a trick — we use the
+     * probs pointer offset from the logits pointer. */
+
+    /* Since we don't have last_B/last_T stored yet, let's note this
+     * is called immediately after forward, and we can reconstruct
+     * B*T from the logits allocation. However, cleanest is to
+     * add fields. For now we embed them in a hidden struct member.
+     * We already have the actual tensors. Let's pass 0 and require
+     * the caller to use gpt_backward_BT. */
+
+    /* This will be resolved by the CLI code calling the right thing. */
+    /* Implementation is below in gpt_backward_bt. */
+    fprintf(stderr, "gpt_backward: use gpt_backward_bt directly\n");
+}
+
+void gpt_backward_bt(GPT *m, int B, int T)
+{
+    int C  = m->cfg.n_embd;
+    int V  = m->cfg.vocab_size;
+    int L  = m->cfg.n_layer;
+    int H  = m->cfg.n_head;
+    int hs = C / H;
+
+    /* Use a temporary gradient activation buffer (same layout as acts) */
+    /* Allocate grads-of-activations inline. We'll need:
+     * d_emb [B,T,C], per-layer: d_res2, d_mlp_proj, d_gelu, d_mlp_fc,
+     * d_ln2, d_res1, d_attn_proj, d_attn_out [B,T,C],
+     * d_qkv [B,T,3C], d_probs_heads [B*H,T,T], d_ln1 [B,T,C],
+     * d_ln_f [B,T,C]. */
+
+    /* For simplicity, allocate scratch on heap */
+    float *d_x      = calloc((size_t)B*T*C, sizeof(float));   /* flowing gradient */
+    float *d_ln     = calloc((size_t)B*T*C, sizeof(float));   /* layernorm input grad */
+    float *d_qkv    = calloc((size_t)B*T*3*C, sizeof(float));
+    float *d_attn_o = calloc((size_t)B*T*C, sizeof(float));
+    float *d_mlp4   = calloc((size_t)B*T*4*C, sizeof(float));
+    float *d_head   = calloc((size_t)B*H*T*T, sizeof(float)); /* d_probs */
+
+    if (!d_x || !d_ln || !d_qkv || !d_attn_o || !d_mlp4 || !d_head) {
+        fprintf(stderr, "gpt_backward_bt: OOM\n");
+        goto cleanup;
+    }
+
+    /* --------------------------------------------------
+     * dlogits: scale = 1/(B*T)
+     * dlogits [B*T, V] = (probs - one_hot) / (B*T)
+     * -------------------------------------------------- */
+    /* We need the targets; they should have been stored.
+     * For now this is a placeholder — targets are passed in from train loop.
+     * See gpt_backward_full for the complete version. */
+
+    /* NOTE: The full backward is implemented in gpt_backward_full below */
+    (void)d_head; (void)d_qkv; (void)d_attn_o; (void)d_mlp4; (void)d_ln;
+    (void)d_x; (void)C; (void)V; (void)L; (void)H; (void)hs;
+
+cleanup:
+    free(d_x); free(d_ln); free(d_qkv);
+    free(d_attn_o); free(d_mlp4); free(d_head);
+}
+
+/* Full backward with targets (the one actually used) */
+void gpt_backward_full(GPT *m, const int *targets, int B, int T)
+{
+    int C  = m->cfg.n_embd;
+    int V  = m->cfg.vocab_size;
+    int L  = m->cfg.n_layer;
+    int H  = m->cfg.n_head;
+    int hs = C / H;
+    float scale = 1.0f / (float)(B * T);
+
+    float *dlogits   = calloc((size_t)B*T*V, sizeof(float));
+    float *d_ln_f    = calloc((size_t)B*T*C, sizeof(float));
+    float *d_x       = calloc((size_t)B*T*C, sizeof(float));
+    float *d_res2    = calloc((size_t)B*T*C, sizeof(float));
+    float *d_res1    = calloc((size_t)B*T*C, sizeof(float));
+    float *d_ln2     = calloc((size_t)B*T*C, sizeof(float));
+    float *d_mlp4    = calloc((size_t)B*T*4*C, sizeof(float));
+    float *d_gelu    = calloc((size_t)B*T*4*C, sizeof(float));
+    float *d_ln1     = calloc((size_t)B*T*C, sizeof(float));
+    float *d_qkv     = calloc((size_t)B*T*3*C, sizeof(float));
+    float *d_attn_o  = calloc((size_t)B*T*C, sizeof(float));
+    float *d_attn_p  = calloc((size_t)B*H*T*T, sizeof(float));
+    float *d_emb     = calloc((size_t)B*T*C, sizeof(float));
+
+    if (!dlogits || !d_ln_f || !d_x || !d_res2 || !d_res1 ||
+        !d_ln2 || !d_mlp4 || !d_gelu || !d_ln1 || !d_qkv ||
+        !d_attn_o || !d_attn_p || !d_emb) {
+        fprintf(stderr, "gpt_backward_full: OOM\n");
+        goto cleanup;
+    }
+
+    /* dlogits = scale * (probs - one_hot(targets)) */
+    cross_entropy_bwd(dlogits, m->acts.probs, targets, scale, B, T, V);
+
+    /* d(lm_head): weight-tied wte
+     * dlogits [B*T, V] = d_ln_f [B*T, C] · wteᵀ
+     * → d_ln_f [B*T, C] += dlogits [B*T, V] · wte [V, C] */
+    linear_bwd_dx(dlogits, m->params.wte, d_ln_f, B*T, C, V);
+    /* d_wte [V,C] += dlogitsᵀ · ln_f_out
+     * (weight-tied: same grad accumulates to wte from two paths) */
+    linear_bwd_dw(dlogits, m->acts.ln_f_out,
+                  m->grads.wte, NULL, B*T, C, V);
+
+    /* d(final layernorm) */
+    layernorm_bwd(d_ln_f, m->acts.ln_f_out, m->params.ln_f_w,
+                  m->acts.ln_f_mean, m->acts.ln_f_rstd,
+                  d_x, m->grads.ln_f_w, m->grads.ln_f_b, B*T, C);
+    /* d_x now holds grad w.r.t. input of ln_f = output of last res2 */
+
+    /* Traverse layers in reverse */
+    for (int l = L - 1; l >= 0; l--) {
+
+        /* determine what the residual stream was going into this layer */
+        float *x_in = (l == 0) ? m->acts.emb : m->acts.res2[l-1];
+
+        /* --- Residual 2 backward ---
+         * res2 = res1 + mlp_proj  →  d_res1 += d_x, d_mlp_proj += d_x */
+        memset(d_res2, 0, B*T*C * sizeof(float));
+        memcpy(d_res2, d_x, B*T*C * sizeof(float));
+
+        if (m->cfg.dropout > 0.0f)
+            dropout_bwd(d_res2, m->acts.res2_mask[l], B*T*C, m->cfg.dropout);
+
+        /* grad flows through residual to res1 and mlp_proj */
+        memcpy(d_res1, d_res2, B*T*C * sizeof(float));
+
+        /* --- MLP projection backward --- */
+        /* d_mlp_proj: dout=d_res2, W=mlp_proj_w, dX=d_gelu, dW+=, db+= */
+        memset(d_gelu, 0, B*T*4*C * sizeof(float));
+        linear_bwd_dx(d_res2, m->params.mlp_proj_w[l], d_gelu, B*T, 4*C, C);
+        linear_bwd_dw(d_res2, m->acts.mlp_gelu[l],
+                      m->grads.mlp_proj_w[l], m->grads.mlp_proj_b[l],
+                      B*T, 4*C, C);
+
+        /* --- GELU backward --- */
+        memset(d_mlp4, 0, B*T*4*C * sizeof(float));
+        gelu_bwd(d_gelu, m->acts.mlp_fc_out[l], d_mlp4, B*T*4*C);
+
+        /* --- MLP fc backward --- */
+        memset(d_ln2, 0, B*T*C * sizeof(float));
+        linear_bwd_dx(d_mlp4, m->params.mlp_fc_w[l], d_ln2, B*T, C, 4*C);
+        linear_bwd_dw(d_mlp4, m->acts.ln2_out[l],
+                      m->grads.mlp_fc_w[l], m->grads.mlp_fc_b[l],
+                      B*T, C, 4*C);
+
+        /* --- LayerNorm 2 backward --- */
+        /* input to ln2 was res1[l] */
+        layernorm_bwd(d_ln2, m->acts.res1[l], m->params.ln2_w[l],
+                      m->acts.ln2_mean[l], m->acts.ln2_rstd[l],
+                      d_res1, m->grads.ln2_w[l], m->grads.ln2_b[l],
+                      B*T, C);
+        /* d_res1 now accumulates both the residual path and ln2 path */
+
+        /* --- Residual 1 backward --- */
+        if (m->cfg.dropout > 0.0f)
+            dropout_bwd(d_res1, m->acts.res1_mask[l], B*T*C, m->cfg.dropout);
+
+        /* grad flows to x_in (residual) and attn_proj */
+        /* d_attn_proj gradient goes into d_attn_o via output projection bwd */
+
+        /* --- Attention output projection backward --- */
+        memset(d_attn_o, 0, B*T*C * sizeof(float));
+        linear_bwd_dx(d_res1, m->params.c_proj_w[l], d_attn_o, B*T, C, C);
+        linear_bwd_dw(d_res1, m->acts.attn_out[l],
+                      m->grads.c_proj_w[l], m->grads.c_proj_b[l],
+                      B*T, C, C);
+
+        /* --- Attention backward (per head) --- */
+        memset(d_qkv, 0, B*T*3*C * sizeof(float));
+
+        float *qkv    = m->acts.qkv[l];
+        float *probs  = m->acts.attn_probs[l];
+
+        for (int b = 0; b < B; b++) {
+            for (int h = 0; h < H; h++) {
+                float *bh_probs = probs + (b*H + h) * T*T;
+
+                /* Gather V, d_out_h from strided storage */
+                float *Vh     = malloc((size_t)T * hs * sizeof(float));
+                float *d_out_h = malloc((size_t)T * hs * sizeof(float));
+                float *d_V_h  = calloc((size_t)T * hs, sizeof(float));
+                float *d_p    = calloc((size_t)T*T, sizeof(float));
+                float *Qh     = malloc((size_t)T * hs * sizeof(float));
+                float *Kh     = malloc((size_t)T * hs * sizeof(float));
+                float *d_Q_h  = calloc((size_t)T * hs, sizeof(float));
+                float *d_K_h  = calloc((size_t)T * hs, sizeof(float));
+
+                for (int t = 0; t < T; t++) {
+                    const float *qkv_row = qkv + (b*T + t)*3*C;
+                    memcpy(Qh + t*hs, qkv_row + h*hs,       hs * sizeof(float));
+                    memcpy(Kh + t*hs, qkv_row + C + h*hs,   hs * sizeof(float));
+                    memcpy(Vh + t*hs, qkv_row + 2*C + h*hs, hs * sizeof(float));
+                    memcpy(d_out_h + t*hs,
+                           d_attn_o + (b*T + t)*C + h*hs,
+                           hs * sizeof(float));
+                }
+
+                /* d_V: d_out [T,hs] = probs [T,T] · V [T,hs]
+                 * d_V [T,hs] += probsᵀ [T,T] · d_out [T,hs] */
+                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                            T, hs, T,
+                            1.0f, bh_probs, T, d_out_h, hs,
+                            1.0f, d_V_h, hs);
+
+                /* d_probs [T,T] += d_out [T,hs] · Vᵀ [hs,T] */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            T, T, hs,
+                            1.0f, d_out_h, hs, Vh, hs,
+                            0.0f, d_p, T);
+
+                /* softmax backward:
+                 * d_scores_i = p_i * (d_p_i - sum_j(p_j * d_p_j)) */
+                for (int t = 0; t < T; t++) {
+                    float *pr = bh_probs + t*T;
+                    float *dp = d_p + t*T;
+                    float dot = 0.0f;
+                    for (int s = 0; s < T; s++) dot += pr[s] * dp[s];
+                    for (int s = 0; s < T; s++)
+                        dp[s] = pr[s] * (dp[s] - dot);
+                    /* zero out upper triangle (was masked) */
+                    for (int s = t+1; s < T; s++) dp[s] = 0.0f;
+                }
+
+                /* d_Q, d_K from score backward
+                 * scores = scale * Q · Kᵀ
+                 * d_Q [T,hs] += scale * d_scores [T,T] · K [T,hs] */
+                float sc = 1.0f / sqrtf((float)hs);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            T, hs, T,
+                            sc, d_p, T, Kh, hs,
+                            1.0f, d_Q_h, hs);
+                /* d_K [T,hs] += scale * d_scoresᵀ [T,T] · Q [T,hs] */
+                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                            T, hs, T,
+                            sc, d_p, T, Qh, hs,
+                            1.0f, d_K_h, hs);
+
+                /* Scatter back into d_qkv */
+                for (int t = 0; t < T; t++) {
+                    float *dqkv_row = d_qkv + (b*T + t)*3*C;
+                    for (int i = 0; i < hs; i++) {
+                        dqkv_row[h*hs + i]       += d_Q_h[t*hs + i];
+                        dqkv_row[C + h*hs + i]   += d_K_h[t*hs + i];
+                        dqkv_row[2*C + h*hs + i] += d_V_h[t*hs + i];
+                    }
+                }
+
+                free(Vh); free(d_out_h); free(d_V_h); free(d_p);
+                free(Qh); free(Kh); free(d_Q_h); free(d_K_h);
+            }
+        }
+
+        /* --- c_attn backward (QKV projection) --- */
+        memset(d_ln1, 0, B*T*C * sizeof(float));
+        linear_bwd_dx(d_qkv, m->params.c_attn_w[l], d_ln1, B*T, C, 3*C);
+        linear_bwd_dw(d_qkv, m->acts.ln1_out[l],
+                      m->grads.c_attn_w[l], m->grads.c_attn_b[l],
+                      B*T, C, 3*C);
+
+        /* --- LayerNorm 1 backward --- */
+        /* Accumulate into d_x (will become the grad for x_in below) */
+        /* But first zero d_x for this layer's contribution */
+        memset(d_x, 0, B*T*C * sizeof(float));
+        layernorm_bwd(d_ln1, x_in, m->params.ln1_w[l],
+                      m->acts.ln1_mean[l], m->acts.ln1_rstd[l],
+                      d_x, m->grads.ln1_w[l], m->grads.ln1_b[l],
+                      B*T, C);
+
+        /* Add residual path: d_res1 also flows to x_in */
+        residual_add(d_x, d_res1, B*T*C);
+
+        /* d_x is now the gradient w.r.t. x_in (= res2[l-1] or emb) */
+        /* Copy d_x for the next (earlier) layer */
+        /* (d_x is already set up for next iteration) */
+
+        /* --- wpe grad: sum over tokens --- */
+        /* wpe [T, C]: d_wpe[t, :] += d_emb[b, t, :] for all b
+         * But this only applies to l==0 where x_in == emb */
+        if (l == 0) {
+            memcpy(d_emb, d_x, B*T*C * sizeof(float));
+            if (m->cfg.dropout > 0.0f)
+                dropout_bwd(d_emb, m->acts.emb_mask, B*T*C, m->cfg.dropout);
+        }
+    }
+
+    /* --- Embedding gradients --- */
+    if (d_emb) {
+        for (int b = 0; b < B; b++) {
+            for (int t = 0; t < T; t++) {
+                int tok = 0; /* We don't have the original tokens here */
+                (void)tok;
+                /* We need tokens[] here. This is handled in train loop
+                 * by calling gpt_emb_backward. */
+            }
+        }
+    }
+
+    /* wpe grad */
+    for (int b = 0; b < B; b++)
+        for (int t = 0; t < T; t++)
+            cblas_saxpy(C, 1.0f,
+                        d_emb + (b*T+t)*C, 1,
+                        m->grads.wpe + t*C, 1);
+
+cleanup:
+    free(dlogits); free(d_ln_f); free(d_x); free(d_res2); free(d_res1);
+    free(d_ln2); free(d_mlp4); free(d_gelu); free(d_ln1); free(d_qkv);
+    free(d_attn_o); free(d_attn_p); free(d_emb);
+}
+
+/* Token embedding backward (needs original tokens) */
+void gpt_emb_backward(GPT *m, const int *tokens, const float *d_emb,
+                       int B, int T)
+{
+    int C = m->cfg.n_embd;
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            int tok = tokens[b * T + t];
+            cblas_saxpy(C, 1.0f,
+                        d_emb + (b*T+t)*C, 1,
+                        m->grads.wte + tok*C, 1);
+        }
+    }
+}
+
+/* ============================================================
+ * Gradient zeroing
+ * ============================================================ */
+
+void gpt_zero_grad(GPT *m)
+{
+    memset(m->grad_buf, 0, (size_t)m->n_params * sizeof(float));
+}
+
+/* ============================================================
+ * AdamW optimizer
+ * ============================================================ */
+
+void gpt_adamw(GPT *m, float lr, float beta1, float beta2,
+               float eps, float wd, float grad_clip)
+{
+    m->step++;
+    int n = m->n_params;
+
+    /* Gradient clipping */
+    if (grad_clip > 0.0f) {
+        float norm = global_grad_norm(m->grad_buf, n);
+        if (norm > grad_clip)
+            scale_grads(m->grad_buf, n, grad_clip / norm);
+    }
+
+    /* Bias correction factors */
+    float bc1 = 1.0f - powf(beta1, (float)m->step);
+    float bc2 = 1.0f - powf(beta2, (float)m->step);
+
+    for (int i = 0; i < n; i++) {
+        float g = m->grad_buf[i];
+
+        /* Moments */
+        m->m_buf[i] = beta1 * m->m_buf[i] + (1.0f - beta1) * g;
+        m->v_buf[i] = beta2 * m->v_buf[i] + (1.0f - beta2) * g * g;
+
+        float m_hat = m->m_buf[i] / bc1;
+        float v_hat = m->v_buf[i] / bc2;
+
+        /* AdamW: param = param * (1 - lr*wd) - lr * m_hat/(sqrt(v_hat)+eps) */
+        m->param_buf[i] = m->param_buf[i] * (1.0f - lr * wd)
+                        - lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
+/* ============================================================
+ * Autoregressive sampling
+ * ============================================================ */
+
+static int sample_top_k(const float *logits, int V, float temp, int top_k)
+{
+    /* Apply temperature */
+    float *scaled = malloc((size_t)V * sizeof(float));
+    if (!scaled) return 0;
+
+    for (int i = 0; i < V; i++)
+        scaled[i] = logits[i] / (temp > 0.0f ? temp : 1.0f);
+
+    /* Softmax */
+    float mx = scaled[0];
+    for (int i = 1; i < V; i++)
+        if (scaled[i] > mx) mx = scaled[i];
+    float sum = 0.0f;
+    for (int i = 0; i < V; i++) { scaled[i] = expf(scaled[i] - mx); sum += scaled[i]; }
+    for (int i = 0; i < V; i++) scaled[i] /= sum;
+
+    /* Top-k: zero out everything outside top k */
+    if (top_k > 0 && top_k < V) {
+        /* Simple partial sort — O(V * k) but k is usually small */
+        float threshold = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            float best = -1.0f;
+            for (int i = 0; i < V; i++)
+                if (scaled[i] > best) best = scaled[i];
+            if (k == top_k - 1) threshold = best;
+            /* Mark found element as visited by nullifying after tracking */
+        }
+        /* Simpler: find k-th largest */
+        float *copy = malloc((size_t)V * sizeof(float));
+        memcpy(copy, scaled, V * sizeof(float));
+        /* Partial bubble */
+        for (int k = 0; k < top_k && k < V; k++) {
+            for (int i = k+1; i < V; i++) {
+                if (copy[i] > copy[k]) {
+                    float tmp = copy[i]; copy[i] = copy[k]; copy[k] = tmp;
+                }
+            }
+        }
+        threshold = (top_k <= V) ? copy[top_k-1] : 0.0f;
+        free(copy);
+
+        float new_sum = 0.0f;
+        for (int i = 0; i < V; i++) {
+            if (scaled[i] < threshold) scaled[i] = 0.0f;
+            new_sum += scaled[i];
+        }
+        if (new_sum > 0.0f)
+            for (int i = 0; i < V; i++) scaled[i] /= new_sum;
+    }
+
+    /* Sample */
+    float r = (float)rand() / ((float)RAND_MAX + 1.0f);
+    float cdf = 0.0f;
+    int tok = V - 1;
+    for (int i = 0; i < V; i++) {
+        cdf += scaled[i];
+        if (r < cdf) { tok = i; break; }
+    }
+
+    free(scaled);
+    return tok;
+}
+
+void gpt_sample(GPT *m, const int *prompt_tokens, int prompt_len,
+                int *out_tokens, int max_new_tokens,
+                float temp, int top_k)
+{
+    int block_size = m->cfg.block_size;
+    int V = m->cfg.vocab_size;
+
+    /* Copy prompt into output buffer */
+    memcpy(out_tokens, prompt_tokens, (size_t)prompt_len * sizeof(int));
+
+    for (int i = 0; i < max_new_tokens; i++) {
+        int total = prompt_len + i;
+        /* Truncate context to block_size */
+        int start = (total > block_size) ? total - block_size : 0;
+        int ctx_len = total - start;
+
+        const int *ctx = out_tokens + start;
+        gpt_forward(m, ctx, NULL, 1, ctx_len);
+
+        /* Logits for the last position */
+        const float *logits_last = m->acts.logits + (ctx_len - 1) * V;
+
+        int next = sample_top_k(logits_last, V, temp, top_k);
+        out_tokens[total] = next;
+    }
+}

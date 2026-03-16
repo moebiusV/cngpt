@@ -1,0 +1,18 @@
+2026-03-16  David Mulryan
+
+	* Initial project creation.
+	* src/ops.c, src/ops.h: BLAS-backed tensor primitives (linear fwd/bwd,
+	  layernorm fwd/bwd, GELU fwd/bwd, softmax, cross-entropy, dropout,
+	  gradient norm / scaling utilities).
+	* src/model.c, src/model.h: GPT-2 model (init, load, save, forward,
+	  backward, AdamW, autoregressive sampling).
+	* src/dataloader.c, src/dataloader.h: mmap binary token loader.
+	* src/tokenizer.c, src/tokenizer.h: GPT-2 BPE decode (display only).
+	* src/cngpt.c: CLI entry point (train / sample / bench subcommands).
+	* scripts/export_weights.py: HuggingFace GPT-2 → cngpt binary export.
+	* tests/check_ops.c: unit tests for ops primitives.
+	* tests/bench.sh: compiler-flag sweep benchmark harness.
+	* configure.ac, Makefile.am, src/Makefile.am, tests/Makefile.am,
+	  man/Makefile.am: GNU autotools packaging.
+	* man/cngpt.1: troff manpage.
+	* COPYING: MIT License.
