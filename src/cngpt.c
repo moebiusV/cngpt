@@ -312,6 +312,38 @@ static int cmd_bench(int argc, char **argv)
 }
 
 /* ============================================================
+ * create-tiny subcommand — write a small random weight file for testing
+ * ============================================================ */
+
+static int cmd_create_tiny(int argc, char **argv)
+{
+    const char *out_path = arg_get(argc, argv, "out");
+    int seed = arg_int(argc, argv, "seed", 1234);
+    if (!out_path) out_path = "tiny_test.bin";
+
+    srand((unsigned int)seed);
+
+    GPTConfig cfg = {
+        .n_layer    = 2,
+        .n_head     = 4,
+        .n_embd     = 32,
+        .vocab_size = 64,
+        .block_size = 8,
+        .dropout    = 0.0f,
+    };
+
+    GPT m;
+    memset(&m, 0, sizeof(m));
+    if (gpt_init(&m, cfg) != 0) { fprintf(stderr, "gpt_init failed\n"); return 1; }
+    gpt_init_weights(&m);
+
+    if (gpt_save(&m, out_path) != 0) { gpt_free(&m); return 1; }
+    printf("Wrote tiny test model (%d params) to %s\n", m.n_params, out_path);
+    gpt_free(&m);
+    return 0;
+}
+
+/* ============================================================
  * main
  * ============================================================ */
 
@@ -357,9 +389,10 @@ int main(int argc, char **argv)
 
     const char *cmd = argv[1];
 
-    if (strcmp(cmd, "train") == 0)  return cmd_train (argc, argv);
-    if (strcmp(cmd, "sample") == 0) return cmd_sample(argc, argv);
-    if (strcmp(cmd, "bench") == 0)  return cmd_bench (argc, argv);
+    if (strcmp(cmd, "train") == 0)        return cmd_train      (argc, argv);
+    if (strcmp(cmd, "sample") == 0)       return cmd_sample     (argc, argv);
+    if (strcmp(cmd, "bench") == 0)        return cmd_bench      (argc, argv);
+    if (strcmp(cmd, "create-tiny") == 0)  return cmd_create_tiny(argc, argv);
 
     fprintf(stderr, "Unknown subcommand: %s\n\n", cmd);
     print_usage();
