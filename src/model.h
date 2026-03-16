@@ -130,6 +130,7 @@ typedef struct {
     /* AdamW optimizer state */
     float *m_buf;                 /* first moment,  same size as param_buf */
     float *v_buf;                 /* second moment, same size as param_buf */
+    float *decay_buf;             /* 1.0 = apply weight decay, 0.0 = skip (biases/LN) */
     int    n_params;              /* total parameter count */
     int    step;                  /* optimizer step counter */
 } GPT;
@@ -140,6 +141,12 @@ typedef struct {
 
 /* Allocate model from config. Params are zero-initialized. */
 int  gpt_init(GPT *m, GPTConfig cfg);
+
+/* Random-initialize params for training from scratch.
+ * Uses normal(0, 0.02) for all weight matrices and embeddings.
+ * Residual projections (c_proj, mlp_proj) are scaled by 1/sqrt(2*n_layer)
+ * as in nanoGPT. Biases are initialized to zero. */
+void gpt_init_weights(GPT *m);
 
 /* Load params from weight file (writes into m->param_buf). */
 int  gpt_load(GPT *m, const char *path);
@@ -160,8 +167,10 @@ int  gpt_resize_acts(GPT *m, int B, int T);
 float gpt_forward(GPT *m, const int *tokens, const int *targets, int B, int T);
 
 /* Backward pass. Must follow a forward call with targets != NULL.
+ * tokens [B, T]: same token ids passed to the forward call (needed for wte grad).
+ * targets [B, T]: same targets passed to the forward call.
  * Accumulates gradients into m->grads. */
-void gpt_backward(GPT *m);
+void gpt_backward(GPT *m, const int *tokens, const int *targets, int B, int T);
 
 /* Zero gradient buffers. */
 void gpt_zero_grad(GPT *m);

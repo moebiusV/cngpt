@@ -132,12 +132,43 @@ int gpt_init(GPT *m, GPTConfig cfg)
     m->grad_buf  = calloc((size_t)m->n_params, sizeof(float));
     m->m_buf     = calloc((size_t)m->n_params, sizeof(float));
     m->v_buf     = calloc((size_t)m->n_params, sizeof(float));
+    m->decay_buf = calloc((size_t)m->n_params, sizeof(float));
 
-    if (!m->param_buf || !m->grad_buf || !m->m_buf || !m->v_buf)
+    if (!m->param_buf || !m->grad_buf || !m->m_buf || !m->v_buf || !m->decay_buf)
         return -1;
 
     assign_weights(&m->params, m->param_buf, &cfg);
     assign_weights(&m->grads,  m->grad_buf,  &cfg);
+
+    /* Fill weight-decay mask.
+     * Rule (matches nanoGPT): parameters with ndim >= 2 decay; 1D params don't.
+     * wte [V,C] and wpe [T,C] are 2D → decay.
+     * LayerNorm weights/biases [C] and all bias vectors → no decay.
+     * Weight matrices (c_attn_w, c_proj_w, mlp_fc_w, mlp_proj_w) → decay. */
+    {
+        int C = cfg.n_embd, V = cfg.vocab_size, T = cfg.block_size;
+        float *d = m->decay_buf;
+        /* wte [V*C]: decay */
+        for (int i = 0; i < V*C; i++) *d++ = 1.0f;
+        /* wpe [T*C]: decay */
+        for (int i = 0; i < T*C; i++) *d++ = 1.0f;
+        for (int l = 0; l < L; l++) {
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln1_w: no decay */
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln1_b: no decay */
+            for (int i = 0; i < 3*C*C; i++) *d++ = 1.0f; /* c_attn_w: decay */
+            for (int i = 0; i < 3*C;   i++) *d++ = 0.0f; /* c_attn_b: no decay */
+            for (int i = 0; i < C*C;   i++) *d++ = 1.0f; /* c_proj_w: decay */
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* c_proj_b: no decay */
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln2_w: no decay */
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* ln2_b: no decay */
+            for (int i = 0; i < 4*C*C; i++) *d++ = 1.0f; /* mlp_fc_w: decay */
+            for (int i = 0; i < 4*C;   i++) *d++ = 0.0f; /* mlp_fc_b: no decay */
+            for (int i = 0; i < C*4*C; i++) *d++ = 1.0f; /* mlp_proj_w: decay */
+            for (int i = 0; i < C;     i++) *d++ = 0.0f; /* mlp_proj_b: no decay */
+        }
+        for (int i = 0; i < C; i++) *d++ = 0.0f; /* ln_f_w: no decay */
+        for (int i = 0; i < C; i++) *d++ = 0.0f; /* ln_f_b: no decay */
+    }
 
     return 0;
 }
@@ -204,6 +235,7 @@ void gpt_free(GPT *m)
     free(m->grad_buf);
     free(m->m_buf);
     free(m->v_buf);
+    free(m->decay_buf);
     free(m->act_buf);
     free(m->mask_buf);
 
@@ -228,6 +260,74 @@ void gpt_free(GPT *m)
 /* ============================================================
  * Activation buffer management
  * ============================================================ */
+
+/* ============================================================
+ * Weight initialization (training from scratch)
+ *
+ * Matches nanoGPT:
+ *   - Normal(0, 0.02) for all weight matrices and embeddings
+ *   - Residual projections (c_proj, mlp_proj) scaled by 1/sqrt(2*n_layer)
+ *   - All biases initialized to zero (already zero from calloc, but explicit)
+ * ============================================================ */
+
+/* Box-Muller normal sample */
+static float randn(void)
+{
+    float u, v, s;
+    do {
+        u = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+        v = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+        s = u*u + v*v;
+    } while (s >= 1.0f || s == 0.0f);
+    return u * sqrtf(-2.0f * logf(s) / s);
+}
+
+static void fill_normal(float *p, int n, float std)
+{
+    for (int i = 0; i < n; i++)
+        p[i] = randn() * std;
+}
+
+void gpt_init_weights(GPT *m)
+{
+    int C = m->cfg.n_embd;
+    int V = m->cfg.vocab_size;
+    int L = m->cfg.n_layer;
+    float std       = 0.02f;
+    float res_std   = 0.02f / sqrtf(2.0f * (float)L);  /* scaled residual init */
+
+    /* Embeddings */
+    fill_normal(m->params.wte, V * C, std);
+    fill_normal(m->params.wpe, m->cfg.block_size * C, std);
+
+    for (int l = 0; l < L; l++) {
+        /* LayerNorm: weights=1, biases=0 */
+        for (int i = 0; i < C; i++) m->params.ln1_w[l][i] = 1.0f;
+        memset(m->params.ln1_b[l], 0, C * sizeof(float));
+        for (int i = 0; i < C; i++) m->params.ln2_w[l][i] = 1.0f;
+        memset(m->params.ln2_b[l], 0, C * sizeof(float));
+
+        /* Attention QKV projection */
+        fill_normal(m->params.c_attn_w[l], 3*C*C, std);
+        memset(m->params.c_attn_b[l], 0, 3*C * sizeof(float));
+
+        /* Attention output projection — residual scaling */
+        fill_normal(m->params.c_proj_w[l], C*C, res_std);
+        memset(m->params.c_proj_b[l], 0, C * sizeof(float));
+
+        /* MLP fc */
+        fill_normal(m->params.mlp_fc_w[l], 4*C*C, std);
+        memset(m->params.mlp_fc_b[l], 0, 4*C * sizeof(float));
+
+        /* MLP projection — residual scaling */
+        fill_normal(m->params.mlp_proj_w[l], C*4*C, res_std);
+        memset(m->params.mlp_proj_b[l], 0, C * sizeof(float));
+    }
+
+    /* Final LayerNorm: weights=1, biases=0 */
+    for (int i = 0; i < C; i++) m->params.ln_f_w[i] = 1.0f;
+    memset(m->params.ln_f_b, 0, C * sizeof(float));
+}
 
 int gpt_resize_acts(GPT *m, int B, int T)
 {
@@ -525,81 +625,12 @@ float gpt_forward(GPT *m, const int *tokens, const int *targets,
 
 /* ============================================================
  * Backward pass
+ *
+ * Single entry point. tokens and targets are the same arrays
+ * that were passed to the preceding gpt_forward call.
  * ============================================================ */
 
-void gpt_backward(GPT *m __attribute__((unused)))
-{
-    /* We need the last batch size/T inferred from act_buf sizes.
-     * Instead, store them: we track them as a convenience via the
-     * fact that act_buf was allocated for these dimensions.
-     * For simplicity let's reuse the last forward call's B and T
-     * by reading from the activation pointer offsets — actually
-     * the cleanest approach is to store B and T on the struct.
-     * We'll add them as fields implicitly via a simple heuristic:
-     * just pass in the sizes. But gpt_backward takes no args, so
-     * we need to store them. Let's use a simple approach: store
-     * last_B, last_T in the GPT struct via a trick — we use the
-     * probs pointer offset from the logits pointer. */
-
-    /* Since we don't have last_B/last_T stored yet, let's note this
-     * is called immediately after forward, and we can reconstruct
-     * B*T from the logits allocation. However, cleanest is to
-     * add fields. For now we embed them in a hidden struct member.
-     * We already have the actual tensors. Let's pass 0 and require
-     * the caller to use gpt_backward_BT. */
-
-    /* This will be resolved by the CLI code calling the right thing. */
-    /* Implementation is below in gpt_backward_bt. */
-    fprintf(stderr, "gpt_backward: use gpt_backward_bt directly\n");
-}
-
-void gpt_backward_bt(GPT *m, int B, int T)
-{
-    int C  = m->cfg.n_embd;
-    int V  = m->cfg.vocab_size;
-    int L  = m->cfg.n_layer;
-    int H  = m->cfg.n_head;
-    int hs = C / H;
-
-    /* Use a temporary gradient activation buffer (same layout as acts) */
-    /* Allocate grads-of-activations inline. We'll need:
-     * d_emb [B,T,C], per-layer: d_res2, d_mlp_proj, d_gelu, d_mlp_fc,
-     * d_ln2, d_res1, d_attn_proj, d_attn_out [B,T,C],
-     * d_qkv [B,T,3C], d_probs_heads [B*H,T,T], d_ln1 [B,T,C],
-     * d_ln_f [B,T,C]. */
-
-    /* For simplicity, allocate scratch on heap */
-    float *d_x      = calloc((size_t)B*T*C, sizeof(float));   /* flowing gradient */
-    float *d_ln     = calloc((size_t)B*T*C, sizeof(float));   /* layernorm input grad */
-    float *d_qkv    = calloc((size_t)B*T*3*C, sizeof(float));
-    float *d_attn_o = calloc((size_t)B*T*C, sizeof(float));
-    float *d_mlp4   = calloc((size_t)B*T*4*C, sizeof(float));
-    float *d_head   = calloc((size_t)B*H*T*T, sizeof(float)); /* d_probs */
-
-    if (!d_x || !d_ln || !d_qkv || !d_attn_o || !d_mlp4 || !d_head) {
-        fprintf(stderr, "gpt_backward_bt: OOM\n");
-        goto cleanup;
-    }
-
-    /* --------------------------------------------------
-     * dlogits: scale = 1/(B*T)
-     * dlogits [B*T, V] = (probs - one_hot) / (B*T)
-     * -------------------------------------------------- */
-    /* We need the targets; they should have been stored.
-     * For now this is a placeholder — targets are passed in from train loop.
-     * See gpt_backward_full for the complete version. */
-
-    /* NOTE: The full backward is implemented in gpt_backward_full below */
-    (void)d_head; (void)d_qkv; (void)d_attn_o; (void)d_mlp4; (void)d_ln;
-    (void)d_x; (void)C; (void)V; (void)L; (void)H; (void)hs;
-
-cleanup:
-    free(d_x); free(d_ln); free(d_qkv);
-    free(d_attn_o); free(d_mlp4); free(d_head);
-}
-
-/* Full backward with targets (the one actually used) */
-void gpt_backward_full(GPT *m, const int *targets, int B, int T)
+void gpt_backward(GPT *m, const int *tokens, const int *targets, int B, int T)
 {
     int C  = m->cfg.n_embd;
     int V  = m->cfg.vocab_size;
@@ -608,259 +639,236 @@ void gpt_backward_full(GPT *m, const int *targets, int B, int T)
     int hs = C / H;
     float scale = 1.0f / (float)(B * T);
 
-    float *dlogits   = calloc((size_t)B*T*V, sizeof(float));
-    float *d_ln_f    = calloc((size_t)B*T*C, sizeof(float));
-    float *d_x       = calloc((size_t)B*T*C, sizeof(float));
-    float *d_res2    = calloc((size_t)B*T*C, sizeof(float));
-    float *d_res1    = calloc((size_t)B*T*C, sizeof(float));
-    float *d_ln2     = calloc((size_t)B*T*C, sizeof(float));
-    float *d_mlp4    = calloc((size_t)B*T*4*C, sizeof(float));
-    float *d_gelu    = calloc((size_t)B*T*4*C, sizeof(float));
-    float *d_ln1     = calloc((size_t)B*T*C, sizeof(float));
-    float *d_qkv     = calloc((size_t)B*T*3*C, sizeof(float));
-    float *d_attn_o  = calloc((size_t)B*T*C, sizeof(float));
-    float *d_attn_p  = calloc((size_t)B*H*T*T, sizeof(float));
-    float *d_emb     = calloc((size_t)B*T*C, sizeof(float));
+    /* Scratch gradient tensors — all allocated once, reused across layers */
+    float *dlogits  = calloc((size_t)B*T*V,   sizeof(float));
+    float *d_ln_f   = calloc((size_t)B*T*C,   sizeof(float));
+    float *d_x      = calloc((size_t)B*T*C,   sizeof(float));
+    float *d_res1   = calloc((size_t)B*T*C,   sizeof(float));
+    float *d_ln2    = calloc((size_t)B*T*C,   sizeof(float));
+    float *d_mlp4   = calloc((size_t)B*T*4*C, sizeof(float));
+    float *d_gelu   = calloc((size_t)B*T*4*C, sizeof(float));
+    float *d_ln1    = calloc((size_t)B*T*C,   sizeof(float));
+    float *d_qkv    = calloc((size_t)B*T*3*C, sizeof(float));
+    float *d_attn_o = calloc((size_t)B*T*C,   sizeof(float));
 
-    if (!dlogits || !d_ln_f || !d_x || !d_res2 || !d_res1 ||
-        !d_ln2 || !d_mlp4 || !d_gelu || !d_ln1 || !d_qkv ||
-        !d_attn_o || !d_attn_p || !d_emb) {
-        fprintf(stderr, "gpt_backward_full: OOM\n");
+    if (!dlogits || !d_ln_f || !d_x || !d_res1 || !d_ln2 ||
+        !d_mlp4 || !d_gelu || !d_ln1 || !d_qkv || !d_attn_o) {
+        fprintf(stderr, "gpt_backward: OOM\n");
         goto cleanup;
     }
 
-    /* dlogits = scale * (probs - one_hot(targets)) */
+    /* --------------------------------------------------
+     * 1. Loss → dlogits
+     * dlogits [B*T, V] = scale * (probs - one_hot(targets))
+     * -------------------------------------------------- */
     cross_entropy_bwd(dlogits, m->acts.probs, targets, scale, B, T, V);
 
-    /* d(lm_head): weight-tied wte
-     * dlogits [B*T, V] = d_ln_f [B*T, C] · wteᵀ
-     * → d_ln_f [B*T, C] += dlogits [B*T, V] · wte [V, C] */
+    /* --------------------------------------------------
+     * 2. lm_head (weight-tied to wte)
+     * d_ln_f [B*T, C]  += dlogits [B*T, V] · wte [V, C]
+     * d_wte  [V, C]    += dlogitsᵀ [V, B*T] · ln_f_out [B*T, C]
+     * -------------------------------------------------- */
     linear_bwd_dx(dlogits, m->params.wte, d_ln_f, B*T, C, V);
-    /* d_wte [V,C] += dlogitsᵀ · ln_f_out
-     * (weight-tied: same grad accumulates to wte from two paths) */
     linear_bwd_dw(dlogits, m->acts.ln_f_out,
                   m->grads.wte, NULL, B*T, C, V);
 
-    /* d(final layernorm) */
-    layernorm_bwd(d_ln_f, m->acts.ln_f_out, m->params.ln_f_w,
-                  m->acts.ln_f_mean, m->acts.ln_f_rstd,
-                  d_x, m->grads.ln_f_w, m->grads.ln_f_b, B*T, C);
-    /* d_x now holds grad w.r.t. input of ln_f = output of last res2 */
+    /* --------------------------------------------------
+     * 3. Final LayerNorm
+     * Input to ln_f is res2[L-1] (or emb when L==0).
+     * -------------------------------------------------- */
+    {
+        float *x_last = (L > 0) ? m->acts.res2[L-1] : m->acts.emb;
+        layernorm_bwd(d_ln_f, x_last, m->params.ln_f_w,
+                      m->acts.ln_f_mean, m->acts.ln_f_rstd,
+                      d_x, m->grads.ln_f_w, m->grads.ln_f_b, B*T, C);
+    }
+    /* d_x = ∂L/∂res2[L-1] */
 
-    /* Traverse layers in reverse */
+    /* --------------------------------------------------
+     * 4. Transformer blocks (reverse order)
+     * -------------------------------------------------- */
     for (int l = L - 1; l >= 0; l--) {
 
-        /* determine what the residual stream was going into this layer */
+        /* Input to this block */
         float *x_in = (l == 0) ? m->acts.emb : m->acts.res2[l-1];
 
-        /* --- Residual 2 backward ---
-         * res2 = res1 + mlp_proj  →  d_res1 += d_x, d_mlp_proj += d_x */
-        memset(d_res2, 0, B*T*C * sizeof(float));
-        memcpy(d_res2, d_x, B*T*C * sizeof(float));
-
+        /* ---- Residual 2 ----
+         * res2[l] = res1[l] + mlp_proj[l]
+         * d_x = ∂L/∂res2[l]; apply dropout bwd if used */
         if (m->cfg.dropout > 0.0f)
-            dropout_bwd(d_res2, m->acts.res2_mask[l], B*T*C, m->cfg.dropout);
+            dropout_bwd(d_x, m->acts.res2_mask[l], B*T*C, m->cfg.dropout);
 
-        /* grad flows through residual to res1 and mlp_proj */
-        memcpy(d_res1, d_res2, B*T*C * sizeof(float));
+        /* Both branches of the add receive d_x */
+        memcpy(d_res1, d_x, B*T*C * sizeof(float));   /* residual branch → res1 */
+        /* d_x is also the gradient for the mlp_proj branch */
 
-        /* --- MLP projection backward --- */
-        /* d_mlp_proj: dout=d_res2, W=mlp_proj_w, dX=d_gelu, dW+=, db+= */
+        /* ---- MLP proj ← GELU ← MLP fc ---- */
         memset(d_gelu, 0, B*T*4*C * sizeof(float));
-        linear_bwd_dx(d_res2, m->params.mlp_proj_w[l], d_gelu, B*T, 4*C, C);
-        linear_bwd_dw(d_res2, m->acts.mlp_gelu[l],
+        linear_bwd_dx(d_x, m->params.mlp_proj_w[l], d_gelu, B*T, 4*C, C);
+        linear_bwd_dw(d_x, m->acts.mlp_gelu[l],
                       m->grads.mlp_proj_w[l], m->grads.mlp_proj_b[l],
                       B*T, 4*C, C);
 
-        /* --- GELU backward --- */
         memset(d_mlp4, 0, B*T*4*C * sizeof(float));
         gelu_bwd(d_gelu, m->acts.mlp_fc_out[l], d_mlp4, B*T*4*C);
 
-        /* --- MLP fc backward --- */
         memset(d_ln2, 0, B*T*C * sizeof(float));
         linear_bwd_dx(d_mlp4, m->params.mlp_fc_w[l], d_ln2, B*T, C, 4*C);
         linear_bwd_dw(d_mlp4, m->acts.ln2_out[l],
                       m->grads.mlp_fc_w[l], m->grads.mlp_fc_b[l],
                       B*T, C, 4*C);
 
-        /* --- LayerNorm 2 backward --- */
-        /* input to ln2 was res1[l] */
+        /* ---- LayerNorm 2 (input = res1[l]) ----
+         * Accumulates into d_res1 (already holds residual-branch grad) */
         layernorm_bwd(d_ln2, m->acts.res1[l], m->params.ln2_w[l],
                       m->acts.ln2_mean[l], m->acts.ln2_rstd[l],
                       d_res1, m->grads.ln2_w[l], m->grads.ln2_b[l],
                       B*T, C);
-        /* d_res1 now accumulates both the residual path and ln2 path */
+        /* d_res1 = ∂L/∂res1[l] */
 
-        /* --- Residual 1 backward --- */
+        /* ---- Residual 1 ----
+         * res1[l] = x_in + attn_proj[l] */
         if (m->cfg.dropout > 0.0f)
             dropout_bwd(d_res1, m->acts.res1_mask[l], B*T*C, m->cfg.dropout);
 
-        /* grad flows to x_in (residual) and attn_proj */
-        /* d_attn_proj gradient goes into d_attn_o via output projection bwd */
-
-        /* --- Attention output projection backward --- */
+        /* ---- c_proj ---- */
         memset(d_attn_o, 0, B*T*C * sizeof(float));
         linear_bwd_dx(d_res1, m->params.c_proj_w[l], d_attn_o, B*T, C, C);
         linear_bwd_dw(d_res1, m->acts.attn_out[l],
                       m->grads.c_proj_w[l], m->grads.c_proj_b[l],
                       B*T, C, C);
 
-        /* --- Attention backward (per head) --- */
+        /* ---- Attention backward (per head) ---- */
         memset(d_qkv, 0, B*T*3*C * sizeof(float));
+        {
+            float *qkv   = m->acts.qkv[l];
+            float *probs = m->acts.attn_probs[l];
+            float sc     = 1.0f / sqrtf((float)hs);
 
-        float *qkv    = m->acts.qkv[l];
-        float *probs  = m->acts.attn_probs[l];
+            for (int b = 0; b < B; b++) {
+                for (int h = 0; h < H; h++) {
+                    const float *bh_probs = probs + (b*H + h) * T*T;
 
-        for (int b = 0; b < B; b++) {
-            for (int h = 0; h < H; h++) {
-                float *bh_probs = probs + (b*H + h) * T*T;
+                    float *Qh     = malloc((size_t)T * hs * sizeof(float));
+                    float *Kh     = malloc((size_t)T * hs * sizeof(float));
+                    float *Vh     = malloc((size_t)T * hs * sizeof(float));
+                    float *d_o_h  = malloc((size_t)T * hs * sizeof(float));
+                    float *d_V_h  = calloc((size_t)T * hs, sizeof(float));
+                    float *d_p    = calloc((size_t)T * T,  sizeof(float));
+                    float *d_Q_h  = calloc((size_t)T * hs, sizeof(float));
+                    float *d_K_h  = calloc((size_t)T * hs, sizeof(float));
 
-                /* Gather V, d_out_h from strided storage */
-                float *Vh     = malloc((size_t)T * hs * sizeof(float));
-                float *d_out_h = malloc((size_t)T * hs * sizeof(float));
-                float *d_V_h  = calloc((size_t)T * hs, sizeof(float));
-                float *d_p    = calloc((size_t)T*T, sizeof(float));
-                float *Qh     = malloc((size_t)T * hs * sizeof(float));
-                float *Kh     = malloc((size_t)T * hs * sizeof(float));
-                float *d_Q_h  = calloc((size_t)T * hs, sizeof(float));
-                float *d_K_h  = calloc((size_t)T * hs, sizeof(float));
-
-                for (int t = 0; t < T; t++) {
-                    const float *qkv_row = qkv + (b*T + t)*3*C;
-                    memcpy(Qh + t*hs, qkv_row + h*hs,       hs * sizeof(float));
-                    memcpy(Kh + t*hs, qkv_row + C + h*hs,   hs * sizeof(float));
-                    memcpy(Vh + t*hs, qkv_row + 2*C + h*hs, hs * sizeof(float));
-                    memcpy(d_out_h + t*hs,
-                           d_attn_o + (b*T + t)*C + h*hs,
-                           hs * sizeof(float));
-                }
-
-                /* d_V: d_out [T,hs] = probs [T,T] · V [T,hs]
-                 * d_V [T,hs] += probsᵀ [T,T] · d_out [T,hs] */
-                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                            T, hs, T,
-                            1.0f, bh_probs, T, d_out_h, hs,
-                            1.0f, d_V_h, hs);
-
-                /* d_probs [T,T] += d_out [T,hs] · Vᵀ [hs,T] */
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            T, T, hs,
-                            1.0f, d_out_h, hs, Vh, hs,
-                            0.0f, d_p, T);
-
-                /* softmax backward:
-                 * d_scores_i = p_i * (d_p_i - sum_j(p_j * d_p_j)) */
-                for (int t = 0; t < T; t++) {
-                    float *pr = bh_probs + t*T;
-                    float *dp = d_p + t*T;
-                    float dot = 0.0f;
-                    for (int s = 0; s < T; s++) dot += pr[s] * dp[s];
-                    for (int s = 0; s < T; s++)
-                        dp[s] = pr[s] * (dp[s] - dot);
-                    /* zero out upper triangle (was masked) */
-                    for (int s = t+1; s < T; s++) dp[s] = 0.0f;
-                }
-
-                /* d_Q, d_K from score backward
-                 * scores = scale * Q · Kᵀ
-                 * d_Q [T,hs] += scale * d_scores [T,T] · K [T,hs] */
-                float sc = 1.0f / sqrtf((float)hs);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            T, hs, T,
-                            sc, d_p, T, Kh, hs,
-                            1.0f, d_Q_h, hs);
-                /* d_K [T,hs] += scale * d_scoresᵀ [T,T] · Q [T,hs] */
-                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                            T, hs, T,
-                            sc, d_p, T, Qh, hs,
-                            1.0f, d_K_h, hs);
-
-                /* Scatter back into d_qkv */
-                for (int t = 0; t < T; t++) {
-                    float *dqkv_row = d_qkv + (b*T + t)*3*C;
-                    for (int i = 0; i < hs; i++) {
-                        dqkv_row[h*hs + i]       += d_Q_h[t*hs + i];
-                        dqkv_row[C + h*hs + i]   += d_K_h[t*hs + i];
-                        dqkv_row[2*C + h*hs + i] += d_V_h[t*hs + i];
+                    /* Gather per-head slices */
+                    for (int t = 0; t < T; t++) {
+                        const float *qr = qkv + (b*T + t)*3*C;
+                        memcpy(Qh   + t*hs, qr + h*hs,       hs * sizeof(float));
+                        memcpy(Kh   + t*hs, qr + C + h*hs,   hs * sizeof(float));
+                        memcpy(Vh   + t*hs, qr + 2*C + h*hs, hs * sizeof(float));
+                        memcpy(d_o_h + t*hs,
+                               d_attn_o + (b*T + t)*C + h*hs,
+                               hs * sizeof(float));
                     }
-                }
 
-                free(Vh); free(d_out_h); free(d_V_h); free(d_p);
-                free(Qh); free(Kh); free(d_Q_h); free(d_K_h);
+                    /* d_V [T,hs] += probsᵀ [T,T] · d_out [T,hs] */
+                    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                                T, hs, T,
+                                1.0f, bh_probs, T, d_o_h, hs,
+                                1.0f, d_V_h, hs);
+
+                    /* d_probs [T,T] = d_out [T,hs] · Vᵀ [hs,T] */
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                                T, T, hs,
+                                1.0f, d_o_h, hs, Vh, hs,
+                                0.0f, d_p, T);
+
+                    /* Softmax backward: d_scores = p ⊙ (d_p − dot(p, d_p))
+                     * Only the lower triangle (j ≤ i) was non-zero. */
+                    for (int t = 0; t < T; t++) {
+                        const float *pr = bh_probs + t*T;
+                        float       *dp = d_p + t*T;
+                        float dot = 0.0f;
+                        for (int s = 0; s <= t; s++) dot += pr[s] * dp[s];
+                        for (int s = 0; s <= t; s++)
+                            dp[s] = pr[s] * (dp[s] - dot);
+                        for (int s = t+1; s < T; s++) dp[s] = 0.0f;
+                    }
+
+                    /* d_Q [T,hs] += sc * d_scores [T,T] · K [T,hs] */
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                T, hs, T,
+                                sc, d_p, T, Kh, hs,
+                                1.0f, d_Q_h, hs);
+                    /* d_K [T,hs] += sc * d_scoresᵀ [T,T] · Q [T,hs] */
+                    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                                T, hs, T,
+                                sc, d_p, T, Qh, hs,
+                                1.0f, d_K_h, hs);
+
+                    /* Scatter back into d_qkv */
+                    for (int t = 0; t < T; t++) {
+                        float *dqr = d_qkv + (b*T + t)*3*C;
+                        for (int i = 0; i < hs; i++) {
+                            dqr[h*hs + i]       += d_Q_h[t*hs + i];
+                            dqr[C + h*hs + i]   += d_K_h[t*hs + i];
+                            dqr[2*C + h*hs + i] += d_V_h[t*hs + i];
+                        }
+                    }
+
+                    free(Qh); free(Kh); free(Vh); free(d_o_h);
+                    free(d_V_h); free(d_p); free(d_Q_h); free(d_K_h);
+                }
             }
         }
 
-        /* --- c_attn backward (QKV projection) --- */
+        /* ---- c_attn (QKV projection) ---- */
         memset(d_ln1, 0, B*T*C * sizeof(float));
         linear_bwd_dx(d_qkv, m->params.c_attn_w[l], d_ln1, B*T, C, 3*C);
         linear_bwd_dw(d_qkv, m->acts.ln1_out[l],
                       m->grads.c_attn_w[l], m->grads.c_attn_b[l],
                       B*T, C, 3*C);
 
-        /* --- LayerNorm 1 backward --- */
-        /* Accumulate into d_x (will become the grad for x_in below) */
-        /* But first zero d_x for this layer's contribution */
+        /* ---- LayerNorm 1 (input = x_in) ----
+         * d_x will hold ∂L/∂x_in from the attention path */
         memset(d_x, 0, B*T*C * sizeof(float));
         layernorm_bwd(d_ln1, x_in, m->params.ln1_w[l],
                       m->acts.ln1_mean[l], m->acts.ln1_rstd[l],
                       d_x, m->grads.ln1_w[l], m->grads.ln1_b[l],
                       B*T, C);
 
-        /* Add residual path: d_res1 also flows to x_in */
+        /* Add residual-path grad: d_res1 = ∂L/∂res1[l] = ∂L/∂x_in via skip */
         residual_add(d_x, d_res1, B*T*C);
-
-        /* d_x is now the gradient w.r.t. x_in (= res2[l-1] or emb) */
-        /* Copy d_x for the next (earlier) layer */
-        /* (d_x is already set up for next iteration) */
-
-        /* --- wpe grad: sum over tokens --- */
-        /* wpe [T, C]: d_wpe[t, :] += d_emb[b, t, :] for all b
-         * But this only applies to l==0 where x_in == emb */
-        if (l == 0) {
-            memcpy(d_emb, d_x, B*T*C * sizeof(float));
-            if (m->cfg.dropout > 0.0f)
-                dropout_bwd(d_emb, m->acts.emb_mask, B*T*C, m->cfg.dropout);
-        }
+        /* d_x = ∂L/∂x_in (total) — passed to next earlier layer */
     }
 
-    /* --- Embedding gradients --- */
-    if (d_emb) {
-        for (int b = 0; b < B; b++) {
-            for (int t = 0; t < T; t++) {
-                int tok = 0; /* We don't have the original tokens here */
-                (void)tok;
-                /* We need tokens[] here. This is handled in train loop
-                 * by calling gpt_emb_backward. */
-            }
-        }
-    }
+    /* --------------------------------------------------
+     * 5. Embedding backward
+     * d_x = ∂L/∂emb  (after exiting the layer loop)
+     * Apply embedding dropout backward if used.
+     * -------------------------------------------------- */
+    if (m->cfg.dropout > 0.0f)
+        dropout_bwd(d_x, m->acts.emb_mask, B*T*C, m->cfg.dropout);
 
-    /* wpe grad */
+    /* wpe [T, C]: d_wpe[t] += sum_b d_emb[b, t, :] */
     for (int b = 0; b < B; b++)
         for (int t = 0; t < T; t++)
             cblas_saxpy(C, 1.0f,
-                        d_emb + (b*T+t)*C, 1,
+                        d_x + (b*T+t)*C, 1,
                         m->grads.wpe + t*C, 1);
 
-cleanup:
-    free(dlogits); free(d_ln_f); free(d_x); free(d_res2); free(d_res1);
-    free(d_ln2); free(d_mlp4); free(d_gelu); free(d_ln1); free(d_qkv);
-    free(d_attn_o); free(d_attn_p); free(d_emb);
-}
-
-/* Token embedding backward (needs original tokens) */
-void gpt_emb_backward(GPT *m, const int *tokens, const float *d_emb,
-                       int B, int T)
-{
-    int C = m->cfg.n_embd;
-    for (int b = 0; b < B; b++) {
+    /* wte [V, C]: d_wte[tokens[b,t]] += d_emb[b, t, :]
+     * Note: weight-tied — wte also receives grad from lm_head (step 2 above) */
+    for (int b = 0; b < B; b++)
         for (int t = 0; t < T; t++) {
-            int tok = tokens[b * T + t];
+            int tok = tokens[b*T + t];
             cblas_saxpy(C, 1.0f,
-                        d_emb + (b*T+t)*C, 1,
+                        d_x + (b*T+t)*C, 1,
                         m->grads.wte + tok*C, 1);
         }
-    }
+
+cleanup:
+    free(dlogits); free(d_ln_f); free(d_x);  free(d_res1);
+    free(d_ln2);   free(d_mlp4); free(d_gelu); free(d_ln1);
+    free(d_qkv);   free(d_attn_o);
 }
 
 /* ============================================================
@@ -903,8 +911,11 @@ void gpt_adamw(GPT *m, float lr, float beta1, float beta2,
         float m_hat = m->m_buf[i] / bc1;
         float v_hat = m->v_buf[i] / bc2;
 
-        /* AdamW: param = param * (1 - lr*wd) - lr * m_hat/(sqrt(v_hat)+eps) */
-        m->param_buf[i] = m->param_buf[i] * (1.0f - lr * wd)
+        /* AdamW: weight decay only for 2D params (weight matrices, embeddings).
+         * Biases and LayerNorm parameters use decay_buf[i] == 0.0, so
+         * effectively wd=0 for those. decay_buf[i] == 1.0 for weight matrices. */
+        float effective_wd = wd * m->decay_buf[i];
+        m->param_buf[i] = m->param_buf[i] * (1.0f - lr * effective_wd)
                         - lr * m_hat / (sqrtf(v_hat) + eps);
     }
 }

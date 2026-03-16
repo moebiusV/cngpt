@@ -94,18 +94,41 @@ static int cmd_train(int argc, char **argv)
     float grad_clip = arg_float(argc, argv, "grad-clip",   1.0f);
     int   log_every = arg_int  (argc, argv, "log-every",    10);
     int   save_every= arg_int  (argc, argv, "save-every",  500);
+    int   init_rand = (arg_get(argc, argv, "init-weights") != NULL);
+    int   seed      = arg_int  (argc, argv, "seed",           0);
 
     if (!data_path) { fprintf(stderr, "train: --data is required\n"); return 1; }
-    if (!weights_path) { fprintf(stderr, "train: --weights is required\n"); return 1; }
+    if (!weights_path && !init_rand) {
+        fprintf(stderr, "train: --weights or --init-weights is required\n");
+        return 1;
+    }
     if (!out_path) out_path = "checkpoint.bin";
 
     /* Build train data filename */
     char train_file[1024];
     snprintf(train_file, sizeof(train_file), "%s/train.bin", data_path);
 
+    if (seed) srand((unsigned int)seed);
+
     GPT m;
     memset(&m, 0, sizeof(m));
-    if (gpt_load(&m, weights_path) != 0) return 1;
+
+    if (init_rand) {
+        /* Training from scratch: parse model size from args */
+        GPTConfig cfg = {
+            .n_layer    = arg_int(argc, argv, "n-layer",    12),
+            .n_head     = arg_int(argc, argv, "n-head",     12),
+            .n_embd     = arg_int(argc, argv, "n-embd",    768),
+            .vocab_size = arg_int(argc, argv, "vocab-size", 50257),
+            .block_size = arg_int(argc, argv, "block-size", 1024),
+            .dropout    = dropout,
+        };
+        if (gpt_init(&m, cfg) != 0) return 1;
+        gpt_init_weights(&m);
+        printf("Initialized model from scratch.\n");
+    } else {
+        if (gpt_load(&m, weights_path) != 0) return 1;
+    }
     m.cfg.dropout = dropout;
 
     DataLoader dl;
@@ -132,12 +155,7 @@ static int cmd_train(int argc, char **argv)
 
         float loss = gpt_forward(&m, dl.inputs, dl.targets, batch, seq);
 
-        /* Full backward pass */
-        extern void gpt_backward_full(GPT *, const int *, int, int);
-        extern void gpt_emb_backward(GPT *, const int *, const float *, int, int);
-        gpt_backward_full(&m, dl.targets, batch, seq);
-        /* wte grad from embedding lookup */
-        gpt_emb_backward(&m, dl.inputs, m.acts.emb, batch, seq);
+        gpt_backward(&m, dl.inputs, dl.targets, batch, seq);
 
         float cur_lr = lr_schedule(lr, lr_min, step, warmup, iters);
         gpt_adamw(&m, cur_lr, 0.9f, 0.95f, 1e-8f, 0.1f, grad_clip);
@@ -301,7 +319,7 @@ static void print_usage(void)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  cngpt train  --data=<dir> --weights=<file> [options]\n"
+        "  cngpt train  --data=<dir> (--weights=<file> | --init-weights) [options]\n"
         "  cngpt sample --weights=<file> [--prompt=TEXT] [options]\n"
         "  cngpt bench  --weights=<file> [--iters=50]\n"
         "\n"
@@ -317,6 +335,10 @@ static void print_usage(void)
         "  --grad-clip=G     gradient clipping norm (default: 1.0)\n"
         "  --log-every=N     print loss every N steps (default: 10)\n"
         "  --save-every=N    save checkpoint every N steps (default: 500)\n"
+        "  --init-weights    random-initialize (training from scratch)\n"
+        "  --n-layer=L --n-head=H --n-embd=C  model size for --init-weights\n"
+        "  --vocab-size=V --block-size=T       context/vocab for --init-weights\n"
+        "  --seed=N          RNG seed for --init-weights\n"
         "\n"
         "Sample options:\n"
         "  --prompt=TEXT     initial context (default: <|endoftext|>)\n"
