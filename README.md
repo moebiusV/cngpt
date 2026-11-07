@@ -1,5 +1,7 @@
 # cngpt — nanoGPT in C with OpenBLAS
 
+[github.com/moebiusV/cngpt](https://github.com/moebiusV/cngpt) | `git clone https://github.com/moebiusV/cngpt`
+
 **nanoGPT translated to C with OpenBLAS acceleration — full training loop, GNU autotools, and a compiler-flag benchmark harness**
 
 A faithful C port of [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT), using
