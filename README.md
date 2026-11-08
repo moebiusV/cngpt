@@ -1,6 +1,6 @@
 # cngpt — nanoGPT in C with OpenBLAS
 
-[project index](https://moebiusv.github.io/) | [github.com/moebiusV/cngpt](https://github.com/moebiusV/cngpt) | `git clone https://github.com/moebiusV/cngpt`
+[Index: All Projects](https://moebiusv.github.io/) | [github.com/moebiusV/cngpt](https://github.com/moebiusV/cngpt) | `git clone https://github.com/moebiusV/cngpt`
 
 **nanoGPT translated to C with OpenBLAS acceleration — full training loop, GNU autotools, and a compiler-flag benchmark harness**
 
