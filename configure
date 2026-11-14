@@ -649,6 +649,7 @@ PYTHON3
 BLAS_LIBS
 BLAS_CFLAGS
 WARN_FLAGS
+OPENMP_CFLAGS
 am__fastdepCC_FALSE
 am__fastdepCC_TRUE
 CCDEPMODE
@@ -742,6 +743,7 @@ ac_user_opts='
 enable_option_checking
 enable_silent_rules
 enable_dependency_tracking
+enable_openmp
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1380,6 +1382,7 @@ Optional Features:
                           do not reject slow dependency extractors
   --disable-dependency-tracking
                           speeds up one-time build
+  --disable-openmp        do not use OpenMP
 
 Some influential environment variables:
   CC          C compiler command
@@ -1511,41 +1514,6 @@ fi
 
 } # ac_fn_c_try_compile
 
-# ac_fn_c_check_header_compile LINENO HEADER VAR INCLUDES
-# -------------------------------------------------------
-# Tests whether HEADER exists and can be compiled using the include files in
-# INCLUDES, setting the cache variable VAR accordingly.
-ac_fn_c_check_header_compile ()
-{
-  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
-printf %s "checking for $2... " >&6; }
-if eval test \${$3+y}
-then :
-  printf %s "(cached) " >&6
-else case e in #(
-  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-$4
-#include <$2>
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"
-then :
-  eval "$3=yes"
-else case e in #(
-  e) eval "$3=no" ;;
-esac
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
-esac
-fi
-eval ac_res=\$$3
-	       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
-printf "%s\n" "$ac_res" >&6; }
-  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
-
-} # ac_fn_c_check_header_compile
-
 # ac_fn_c_try_link LINENO
 # -----------------------
 # Try to link conftest.$ac_ext, and return whether this succeeded.
@@ -1593,6 +1561,41 @@ fi
   as_fn_set_status $ac_retval
 
 } # ac_fn_c_try_link
+
+# ac_fn_c_check_header_compile LINENO HEADER VAR INCLUDES
+# -------------------------------------------------------
+# Tests whether HEADER exists and can be compiled using the include files in
+# INCLUDES, setting the cache variable VAR accordingly.
+ac_fn_c_check_header_compile ()
+{
+  as_lineno=${as_lineno-"$1"} as_lineno_stack=as_lineno_stack=$as_lineno_stack
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $2" >&5
+printf %s "checking for $2... " >&6; }
+if eval test \${$3+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+$4
+#include <$2>
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  eval "$3=yes"
+else case e in #(
+  e) eval "$3=no" ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+eval ac_res=\$$3
+	       { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_res" >&5
+printf "%s\n" "$ac_res" >&6; }
+  eval $as_lineno_stack; ${as_lineno_stack:+:} unset as_lineno
+
+} # ac_fn_c_check_header_compile
 ac_configure_args_raw=
 for ac_arg
 do
@@ -4442,11 +4445,200 @@ fi
 
 
 
-AX_CHECK_COMPILE_FLAG(-Wall,    WARN_FLAGS="$WARN_FLAGS -Wall")
-AX_CHECK_COMPILE_FLAG(-Wextra,  WARN_FLAGS="$WARN_FLAGS -Wextra")
-AX_CHECK_COMPILE_FLAG(-Wpedantic,WARN_FLAGS="$WARN_FLAGS -Wpedantic")
-AX_CHECK_COMPILE_FLAG(-Wno-unused-parameter,
-    WARN_FLAGS="$WARN_FLAGS -Wno-unused-parameter")
+if test -e penmp || test -e mp; then
+  as_fn_error $? "AC_OPENMP clobbers files named 'mp' and 'penmp'. Aborting configure because one of these files already exists." "$LINENO" 5
+fi
+
+# Check whether --enable-openmp was given.
+if test ${enable_openmp+y}
+then :
+  enableval=$enable_openmp;
+fi
+
+  OPENMP_CFLAGS=
+  if test "$enable_openmp" != no; then
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $CC option to support OpenMP" >&5
+printf %s "checking for $CC option to support OpenMP... " >&6; }
+if test ${ac_cv_prog_c_openmp+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_cv_prog_c_openmp='not found'
+                                                                        for ac_option in '' -fopenmp -xopenmp -openmp -mp -omp -qsmp=omp -homp \
+                       -Popenmp --openmp; do
+
+        ac_save_CFLAGS=$CFLAGS
+        CFLAGS="$CFLAGS $ac_option"
+        cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#ifndef _OPENMP
+#error "OpenMP not supported"
+#endif
+#include <omp.h>
+int main (void) { return omp_get_num_threads (); }
+
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#ifndef _OPENMP
+#error "OpenMP not supported"
+#endif
+#include <omp.h>
+int main (void) { return omp_get_num_threads (); }
+
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_prog_c_openmp=$ac_option
+else case e in #(
+  e) ac_cv_prog_c_openmp='unsupported' ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+        CFLAGS=$ac_save_CFLAGS
+
+        if test "$ac_cv_prog_c_openmp" != 'not found'; then
+          break
+        fi
+      done
+      if test "$ac_cv_prog_c_openmp" = 'not found'; then
+        ac_cv_prog_c_openmp='unsupported'
+      elif test "$ac_cv_prog_c_openmp" = ''; then
+        ac_cv_prog_c_openmp='none needed'
+      fi
+                        rm -f penmp mp ;;
+esac
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_prog_c_openmp" >&5
+printf "%s\n" "$ac_cv_prog_c_openmp" >&6; }
+    if test "$ac_cv_prog_c_openmp" != 'unsupported' && \
+       test "$ac_cv_prog_c_openmp" != 'none needed'; then
+      OPENMP_CFLAGS="$ac_cv_prog_c_openmp"
+    fi
+  fi
+
+
+
+
+
+
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether $CC accepts -Wall" >&5
+printf %s "checking whether $CC accepts -Wall... " >&6; }
+    cngpt_save_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -Wall -Werror"
+    cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }; WARN_FLAGS="$WARN_FLAGS -Wall"
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; };  ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+    CFLAGS="$cngpt_save_CFLAGS"
+
+
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether $CC accepts -Wextra" >&5
+printf %s "checking whether $CC accepts -Wextra... " >&6; }
+    cngpt_save_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -Wextra -Werror"
+    cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }; WARN_FLAGS="$WARN_FLAGS -Wextra"
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; };  ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+    CFLAGS="$cngpt_save_CFLAGS"
+
+
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether $CC accepts -Wpedantic" >&5
+printf %s "checking whether $CC accepts -Wpedantic... " >&6; }
+    cngpt_save_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -Wpedantic -Werror"
+    cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }; WARN_FLAGS="$WARN_FLAGS -Wpedantic"
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; };  ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+    CFLAGS="$cngpt_save_CFLAGS"
+
+
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether $CC accepts -Wno-unused-parameter" >&5
+printf %s "checking whether $CC accepts -Wno-unused-parameter... " >&6; }
+    cngpt_save_CFLAGS="$CFLAGS"
+    CFLAGS="$CFLAGS -Wno-unused-parameter -Werror"
+    cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }; WARN_FLAGS="$WARN_FLAGS -Wno-unused-parameter"
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; };  ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+    CFLAGS="$cngpt_save_CFLAGS"
 
 
 
@@ -4676,25 +4868,26 @@ esac
 fi
 
 
+saved_CFLAGS="$CFLAGS"
 saved_LIBS="$LIBS"
+CFLAGS="$CFLAGS $BLAS_CFLAGS"
 LIBS="$LIBS $BLAS_LIBS -lm -lpthread"
 { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for cblas_sgemm in OpenBLAS" >&5
 printf %s "checking for cblas_sgemm in OpenBLAS... " >&6; }
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
-    #include <stddef.h>
-    #ifdef HAVE_CBLAS_H
-    # include <cblas.h>
-    #else
-    # include <x86_64-linux-gnu/cblas.h>
-    #endif
-    extern void cblas_sgemm();
+    #include <cblas.h>
 
 int
 main (void)
 {
-cblas_sgemm();
+
+    float a = 1.0f, b = 1.0f, c = 0.0f;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                1, 1, 1, 1.0f, &a, 1, &b, 1, 0.0f, &c, 1);
+    return c > 0.5f ? 0 : 1;
+
   ;
   return 0;
 }
@@ -4715,6 +4908,7 @@ esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
     conftest$ac_exeext conftest.$ac_ext
+CFLAGS="$saved_CFLAGS"
 LIBS="$saved_LIBS"
 
 
@@ -6250,6 +6444,7 @@ echo ""
 echo "cngpt $PACKAGE_VERSION configuration:"
 echo "  CC         : $CC"
 echo "  CFLAGS     : $CFLAGS $WARN_FLAGS"
+echo "  OpenMP     : ${OPENMP_CFLAGS:-none}"
 echo "  BLAS_CFLAGS: $BLAS_CFLAGS"
 echo "  BLAS_LIBS  : $BLAS_LIBS"
 echo "  Python3    : $PYTHON3"

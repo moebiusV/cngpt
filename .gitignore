@@ -28,3 +28,13 @@ Makefile
 src/Makefile
 tests/Makefile
 man/Makefile
+
+# make check output
+tests/check_ops
+tests/check_grad
+tests/check_fast
+tests/*.log
+tests/*.trs
+test-suite.log
+.dirstamp
+*~

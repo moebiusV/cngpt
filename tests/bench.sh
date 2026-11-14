@@ -4,7 +4,14 @@
 # Sweeps optimization flags and records tokens/sec for inference.
 # Also sweeps OPENBLAS_NUM_THREADS.
 #
-# Usage: ./tests/bench.sh [--weights=<file>] [--iters=50] [--seq=128]
+# Usage: ./tests/bench.sh --weights=<file> [--iters=50] [--seq=128]
+#                         [--fast] [--python-tok-s=N]
+#
+#   --fast            benchmark the optimized forward pass (src/fast.c);
+#                     the thread sweep then sets its own thread count
+#                     (one pinned thread per core) instead of OpenBLAS's
+#   --python-tok-s=N  tokens/sec of the original nanoGPT on this machine
+#                     (scripts/bench_nanogpt.py); adds a "vs Python" column
 #
 # MIT License — see COPYING
 
@@ -16,12 +23,16 @@ set -euo pipefail
 WEIGHTS=""
 ITERS=50
 SEQ=128
+FAST=0
+PYTHON_TOKS=""
 
 for arg in "$@"; do
     case "$arg" in
         --weights=*) WEIGHTS="${arg#*=}" ;;
         --iters=*)   ITERS="${arg#*=}" ;;
         --seq=*)     SEQ="${arg#*=}" ;;
+        --fast)      FAST=1 ;;
+        --python-tok-s=*) PYTHON_TOKS="${arg#*=}" ;;
     esac
 done
 
@@ -42,12 +53,12 @@ SRC_DIR="$(cd "$(dirname "$0")/../src" && pwd)"
 TMP_DIR=$(mktemp -d /tmp/cngpt_bench_XXXXXX)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-SRCS="$SRC_DIR/cngpt.c $SRC_DIR/model.c $SRC_DIR/ops.c \
+SRCS="$SRC_DIR/cngpt.c $SRC_DIR/model.c $SRC_DIR/ops.c $SRC_DIR/fast.c \
       $SRC_DIR/dataloader.c $SRC_DIR/tokenizer.c"
 
 BLAS_INC="-I/usr/include/x86_64-linux-gnu"
 BLAS_LIB="-L/usr/lib/x86_64-linux-gnu -lopenblas"
-COMMON_FLAGS="-std=c11 $BLAS_INC"
+COMMON_FLAGS="-std=c11 -fopenmp $BLAS_INC"
 LINK_FLAGS="$BLAS_LIB -lm -lpthread"
 
 # Compile with given flags, return binary path
@@ -73,8 +84,13 @@ run_bench() {
         return
     fi
     local output
-    output=$(OPENBLAS_NUM_THREADS="$threads" \
-             "$bin" bench --weights="$WEIGHTS" --iters="$ITERS" --seq="$SEQ" 2>/dev/null)
+    if [ "$FAST" = 1 ]; then
+        output=$("$bin" bench --weights="$WEIGHTS" --iters="$ITERS" --seq="$SEQ" \
+                 --fast --threads="$threads" 2>/dev/null)
+    else
+        output=$(OPENBLAS_NUM_THREADS="$threads" \
+                 "$bin" bench --weights="$WEIGHTS" --iters="$ITERS" --seq="$SEQ" 2>/dev/null)
+    fi
     # Parse "  tok/s      : 123.4"
     echo "$output" | grep "tok/s" | awk '{print $NF}'
 }
@@ -154,8 +170,8 @@ fi
 echo ""
 echo "=== Compiler Flag Benchmark (threads=1, seq=$SEQ, iters=$ITERS) ==="
 echo ""
-printf "%-10s | %10s | %10s | %10s\n" "FLAG_SET" "tok/s" "ms/tok" "speedup"
-echo "-----------|------------|------------|------------"
+printf "%-10s | %10s | %10s | %10s | %10s\n" "FLAG_SET" "tok/s" "ms/tok" "speedup" "vs Python"
+echo "-----------|------------|------------|------------|------------"
 
 BASE_TOKS=""
 ALL_RESULTS=()
@@ -169,7 +185,7 @@ for name in "${measure_flags[@]}"; do
     fi
     toks=$(run_bench "$bin" 1)
     if [ -z "$toks" ] || [ "$toks" = "-1" ]; then
-        printf "%-10s | %10s | %10s | %10s\n" "$name" "ERR" "ERR" "ERR"
+        printf "%-10s | %10s | %10s | %10s | %10s\n" "$name" "ERR" "ERR" "ERR" "ERR"
         continue
     fi
 
@@ -185,7 +201,11 @@ for name in "${measure_flags[@]}"; do
         speedup="—"
     fi
 
-    printf "%-10s | %10.1f | %10s | %10s\n" "$name" "$toks" "${ms_tok}ms" "$speedup"
+    vs_py="-"
+    if [ -n "$PYTHON_TOKS" ]; then
+        vs_py=$(echo "$toks $PYTHON_TOKS" | awk '{printf "%.2fx", $1/$2}')
+    fi
+    printf "%-10s | %10.1f | %10s | %10s | %10s\n" "$name" "$toks" "${ms_tok}ms" "$speedup" "$vs_py"
     ALL_RESULTS+=("$name $toks")
 done
 
@@ -195,13 +215,18 @@ done
 BEST_BIN="${BINS[FULL]:-${BINS[NATIVE]:-}}"
 if [ -n "$BEST_BIN" ]; then
     echo ""
-    echo "=== OpenBLAS Thread Count Sweep (FULL flags, seq=$SEQ) ==="
+    echo "=== Thread Count Sweep ($([ "$FAST" = 1 ] && echo "fast path" || echo "OpenBLAS threads"), FULL flags, seq=$SEQ) ==="
     echo ""
     printf "%-12s | %10s | %10s\n" "THREADS" "tok/s" "speedup"
     echo "-------------|------------|------------"
 
     BASE_THREAD_TOKS=""
-    for t in 1 2 4 6 8; do
+    if [ "$FAST" = 1 ]; then
+        THREAD_LIST=$(seq 1 "$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)")
+    else
+        THREAD_LIST="1 2 4 6 8"
+    fi
+    for t in $THREAD_LIST; do
         toks=$(run_bench "$BEST_BIN" "$t")
         if [ -z "$toks" ] || [ "$toks" = "-1" ]; then continue; fi
         if [ -z "$BASE_THREAD_TOKS" ]; then BASE_THREAD_TOKS="$toks"; fi
@@ -213,6 +238,7 @@ fi
 echo ""
 echo "=== Summary ==="
 echo "Weights: $WEIGHTS"
+echo "Forward pass: $([ "$FAST" = 1 ] && echo fast || echo straightforward)"
 echo "Sequence length: $SEQ"
 echo "Iters per run: $ITERS"
 echo "System: $(uname -m), $(nproc) logical CPUs"

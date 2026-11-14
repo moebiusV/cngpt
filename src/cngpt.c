@@ -12,12 +12,13 @@
  *   cngpt sample --weights=<file> --prompt="Once upon"
  *                [--tokens=200] [--temp=0.8] [--topk=40]
  *                [--vocab=<vocab_file>]
- *   cngpt bench  --weights=<file> [--iters=50]
+ *   cngpt bench  --weights=<file> [--iters=50] [--seq=128] [--fast] [--threads=N]
  *
  * MIT License — see COPYING
  */
 
 #include "model.h"
+#include "fast.h"
 #include "dataloader.h"
 #include "tokenizer.h"
 
@@ -276,20 +277,27 @@ static int cmd_sample(int argc, char **argv)
  * Bench subcommand
  * ============================================================ */
 
-static double bench_inference(GPT *m, int iters, int seq_len)
+static double bench_inference(GPT *m, int iters, int seq_len, int fast)
 {
     /* Dummy input: all zeros → token 0 */
     int *tokens = calloc((size_t)seq_len, sizeof(int));
     if (!tokens) return -1.0;
 
+    FastCtx fc;
+    fast_init(&fc);
+
     /* Warm up */
-    gpt_forward(m, tokens, NULL, 1, seq_len);
+    if (fast) gpt_forward_fast(m, &fc, tokens, 1, seq_len);
+    else      gpt_forward(m, tokens, NULL, 1, seq_len);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int i = 0; i < iters; i++)
-        gpt_forward(m, tokens, NULL, 1, seq_len);
+    for (int i = 0; i < iters; i++) {
+        if (fast) gpt_forward_fast(m, &fc, tokens, 1, seq_len);
+        else      gpt_forward(m, tokens, NULL, 1, seq_len);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    fast_free(&fc);
 
     double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
                       + (t1.tv_nsec - t0.tv_nsec) / 1e6;
@@ -309,12 +317,45 @@ static int cmd_bench(int argc, char **argv)
     memset(&m, 0, sizeof(m));
     if (gpt_load(&m, weights_path) != 0) return 1;
 
+    /* --fast: the optimized forward pass (fast.c) instead of gpt_forward().
+     * Checked by hand: arg_get() would swallow the next argument. */
+    int fast = 0;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--fast") == 0) fast = 1;
+    /* --threads=N: threads for the fast path (else OMP_NUM_THREADS).
+     * The straightforward path uses OPENBLAS_NUM_THREADS as before. */
+    if (fast) fast_set_threads(arg_int(argc, argv, "threads", 0));
+
     printf("Model: %d layers, %d heads, %d embd, %d params\n",
            m.cfg.n_layer, m.cfg.n_head, m.cfg.n_embd, m.n_params);
-    printf("Benchmarking %d inference passes (seq_len=%d, batch=1)...\n\n",
-           iters, seq_len);
+    printf("Benchmarking %d inference passes (seq_len=%d, batch=1, %s)...\n\n",
+           iters, seq_len, fast ? "fast" : "straightforward");
 
-    double ms_per_fwd = bench_inference(&m, iters, seq_len);
+    if (fast) {
+        /* Same input through both versions: compare final-position logits */
+        int *tk = malloc((size_t)seq_len * sizeof(int));
+        if (!tk) return 1;
+        unsigned int s = 12345u;
+        for (int i = 0; i < seq_len; i++) {
+            s = s * 1664525u + 1013904223u;
+            tk[i] = (int)((s >> 8) % (unsigned)m.cfg.vocab_size);
+        }
+        gpt_forward(&m, tk, NULL, 1, seq_len);
+        FastCtx fc;
+        fast_init(&fc);
+        const float *fl = gpt_forward_fast(&m, &fc, tk, 1, seq_len);
+        const float *rl = m.acts.logits + (size_t)(seq_len - 1) * m.cfg.vocab_size;
+        float maxd = 0.0f;
+        for (int v = 0; v < m.cfg.vocab_size && fl; v++) {
+            float d = fabsf(fl[v] - rl[v]);
+            if (d > maxd) maxd = d;
+        }
+        printf("  max |logit diff| vs gpt_forward : %.3e\n", maxd);
+        fast_free(&fc);
+        free(tk);
+    }
+
+    double ms_per_fwd = bench_inference(&m, iters, seq_len, fast);
     double tok_per_s  = 1000.0 * seq_len / ms_per_fwd;
 
     printf("  ms/forward : %.2f\n", ms_per_fwd);
@@ -366,7 +407,7 @@ static void print_usage(void)
         "Usage:\n"
         "  cngpt train  --data=<dir> (--weights=<file> | --init-weights) [options]\n"
         "  cngpt sample --weights=<file> [--prompt=TEXT] [options]\n"
-        "  cngpt bench  --weights=<file> [--iters=50]\n"
+        "  cngpt bench  --weights=<file> [--iters=50] [--seq=128] [--fast] [--threads=N]\n"
         "\n"
         "Train options:\n"
         "  --out=FILE        checkpoint output (default: checkpoint.bin)\n"

@@ -2,9 +2,9 @@
 ##
 ## MIT License — see COPYING
 
-AM_CFLAGS = -std=c11 $(WARN_FLAGS) $(BLAS_CFLAGS)
+AM_CFLAGS = -std=c11 $(WARN_FLAGS) $(BLAS_CFLAGS) $(OPENMP_CFLAGS)
 
-check_PROGRAMS = check_ops check_grad
+check_PROGRAMS = check_ops check_grad check_fast
 
 check_ops_SOURCES = \
     check_ops.c \
@@ -26,7 +26,22 @@ check_grad_SOURCES = \
 
 check_grad_LDADD = $(BLAS_LIBS) -lm -lpthread
 
-TESTS = check_ops check_grad
+check_fast_SOURCES = \
+    check_fast.c \
+    ../src/model.c \
+    ../src/model.h \
+    ../src/ops.c \
+    ../src/ops.h \
+    ../src/fast.c \
+    ../src/fast.h \
+    ../src/dataloader.c \
+    ../src/dataloader.h \
+    ../src/tokenizer.c \
+    ../src/tokenizer.h
+
+check_fast_LDADD = $(BLAS_LIBS) $(OPENMP_CFLAGS) -lm -lpthread
+
+TESTS = check_ops check_grad check_fast
 
 ## bench target: compiler-flag sweep (requires weights file)
 ## Usage: make bench WEIGHTS=gpt2.bin
@@ -38,4 +53,4 @@ bench:
 	fi
 	bash $(srcdir)/bench.sh --weights=$(WEIGHTS)
 
-EXTRA_DIST = bench.sh check_grad.c
+EXTRA_DIST = bench.sh check_grad.c check_fast.c

@@ -6,6 +6,7 @@ SUBDIRS = src tests man
 
 EXTRA_DIST = \
     scripts/export_weights.py \
+    scripts/bench_nanogpt.py \
     README.md \
     AUTHORS \
     NEWS \

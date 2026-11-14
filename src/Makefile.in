@@ -102,10 +102,10 @@ CONFIG_CLEAN_VPATH_FILES =
 am__installdirs = "$(DESTDIR)$(bindir)"
 PROGRAMS = $(bin_PROGRAMS)
 am_cngpt_OBJECTS = cngpt.$(OBJEXT) model.$(OBJEXT) ops.$(OBJEXT) \
-	dataloader.$(OBJEXT) tokenizer.$(OBJEXT)
+	fast.$(OBJEXT) dataloader.$(OBJEXT) tokenizer.$(OBJEXT)
 cngpt_OBJECTS = $(am_cngpt_OBJECTS)
 am__DEPENDENCIES_1 =
-cngpt_DEPENDENCIES = $(am__DEPENDENCIES_1)
+cngpt_DEPENDENCIES = $(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
 AM_V_P = $(am__v_P_@AM_V@)
 am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
 am__v_P_0 = false
@@ -122,7 +122,7 @@ DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)
 depcomp = $(SHELL) $(top_srcdir)/depcomp
 am__maybe_remake_depfiles = depfiles
 am__depfiles_remade = ./$(DEPDIR)/cngpt.Po ./$(DEPDIR)/dataloader.Po \
-	./$(DEPDIR)/model.Po ./$(DEPDIR)/ops.Po \
+	./$(DEPDIR)/fast.Po ./$(DEPDIR)/model.Po ./$(DEPDIR)/ops.Po \
 	./$(DEPDIR)/tokenizer.Po
 am__mv = mv -f
 COMPILE = $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) \
@@ -198,6 +198,7 @@ LTLIBOBJS = @LTLIBOBJS@
 MAKEINFO = @MAKEINFO@
 MKDIR_P = @MKDIR_P@
 OBJEXT = @OBJEXT@
+OPENMP_CFLAGS = @OPENMP_CFLAGS@
 PACKAGE = @PACKAGE@
 PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
 PACKAGE_NAME = @PACKAGE_NAME@
@@ -257,19 +258,21 @@ target_alias = @target_alias@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-AM_CFLAGS = -std=c11 $(WARN_FLAGS) $(BLAS_CFLAGS)
+AM_CFLAGS = -std=c11 $(WARN_FLAGS) $(BLAS_CFLAGS) $(OPENMP_CFLAGS)
 cngpt_SOURCES = \
     cngpt.c \
     model.c \
     model.h \
     ops.c \
     ops.h \
+    fast.c \
+    fast.h \
     dataloader.c \
     dataloader.h \
     tokenizer.c \
     tokenizer.h
 
-cngpt_LDADD = $(BLAS_LIBS) -lm -lpthread
+cngpt_LDADD = $(BLAS_LIBS) $(OPENMP_CFLAGS) -lm -lpthread
 all: all-am
 
 .SUFFIXES:
@@ -358,6 +361,7 @@ distclean-compile:
 
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/cngpt.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/dataloader.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/fast.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/model.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ops.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/tokenizer.Po@am__quote@ # am--include-marker
@@ -369,15 +373,17 @@ $(am__depfiles_remade):
 am--depfiles: $(am__depfiles_remade)
 
 .c.o:
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(COMPILE) -MT $@ -MD -MP -MF $(DEPDIR)/$*.Tpo -c -o $@ $<
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/$*.Tpo $(DEPDIR)/$*.Po
+@am__fastdepCC_TRUE@	$(AM_V_CC)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.o$$||'`;\
+@am__fastdepCC_TRUE@	$(COMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ $< &&\
+@am__fastdepCC_TRUE@	$(am__mv) $$depbase.Tpo $$depbase.Po
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
 @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(COMPILE) -c -o $@ $<
 
 .c.obj:
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(COMPILE) -MT $@ -MD -MP -MF $(DEPDIR)/$*.Tpo -c -o $@ `$(CYGPATH_W) '$<'`
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/$*.Tpo $(DEPDIR)/$*.Po
+@am__fastdepCC_TRUE@	$(AM_V_CC)depbase=`echo $@ | sed 's|[^/]*$$|$(DEPDIR)/&|;s|\.obj$$||'`;\
+@am__fastdepCC_TRUE@	$(COMPILE) -MT $@ -MD -MP -MF $$depbase.Tpo -c -o $@ `$(CYGPATH_W) '$<'` &&\
+@am__fastdepCC_TRUE@	$(am__mv) $$depbase.Tpo $$depbase.Po
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
 @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(COMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
@@ -510,6 +516,7 @@ clean-am: clean-binPROGRAMS clean-generic mostlyclean-am
 distclean: distclean-am
 	-rm -f ./$(DEPDIR)/cngpt.Po
 	-rm -f ./$(DEPDIR)/dataloader.Po
+	-rm -f ./$(DEPDIR)/fast.Po
 	-rm -f ./$(DEPDIR)/model.Po
 	-rm -f ./$(DEPDIR)/ops.Po
 	-rm -f ./$(DEPDIR)/tokenizer.Po
@@ -560,6 +567,7 @@ installcheck-am:
 maintainer-clean: maintainer-clean-am
 	-rm -f ./$(DEPDIR)/cngpt.Po
 	-rm -f ./$(DEPDIR)/dataloader.Po
+	-rm -f ./$(DEPDIR)/fast.Po
 	-rm -f ./$(DEPDIR)/model.Po
 	-rm -f ./$(DEPDIR)/ops.Po
 	-rm -f ./$(DEPDIR)/tokenizer.Po
