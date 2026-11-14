@@ -24,6 +24,7 @@ that sweeps compiler optimization flags to find the fastest build on your CPU.
   - [train](#train)
   - [sample](#sample)
   - [bench](#bench)
+- [Two Forward Passes](#two-forward-passes)
 - [Benchmark Harness](#benchmark-harness)
 - [Architecture](#architecture)
   - [Memory model](#memory-model)
@@ -68,6 +69,9 @@ function. Goals:
 - **`mmap` data loader**: training data is memory-mapped and streamed as `uint16_t` token ids,
   wrapping seamlessly across epoch boundaries.
 - **Autoregressive sampling**: temperature + top-k filtering.
+- **Fast inference path**: a second, inference-only forward pass
+  (`--fast`) that computes only what the logits need and scales across
+  cores; about 1.1x PyTorch on one thread and 1.6x on six.
 - **Compiler benchmark harness**: `tests/bench.sh` sweeps 10 flag combinations including PGO and
   prints a nicely-aligned table of tokens/sec and speedup over `-O2`.
 - **GNU autotools packaging**: `./configure && make && make install` works out of the box.
@@ -278,8 +282,13 @@ which is the correct BPE sequence start.
 ### bench
 
 ```
-cngpt bench --weights=<file> [--iters=50] [--seq=128]
+cngpt bench --weights=<file> [--iters=50] [--seq=128] [--fast] [--threads=N]
 ```
+
+`--fast` uses the optimized forward pass (see [Two Forward Passes](#two-forward-passes))
+and first prints the largest difference between its logits and
+`gpt_forward()`'s. `--threads=N` sets its thread count (default: one per
+physical core); the straightforward pass uses `OPENBLAS_NUM_THREADS`.
 
 Runs `--iters` forward passes (batch=1) and reports:
 ```
@@ -291,6 +300,43 @@ For a full compiler-flag sweep, see [Benchmark Harness](#benchmark-harness).
 
 ---
 
+## Two Forward Passes
+
+cngpt has two implementations of the forward pass, the way cugpt has
+`microgpt.c` and `cugpt.c`:
+
+| | Where | What it is |
+|---|---|---|
+| `gpt_forward()` | `src/model.c` | Straightforward. Keeps every activation for the backward pass, computes logits for every position. Used by `train`, `sample` and the tests, and the reference the fast one is checked against. |
+| `gpt_forward_fast()` | `src/fast.c` | Inference only. Select it with `cngpt bench --fast`. |
+
+What the fast version does differently:
+
+- **Scratch buffers allocated once**, reused by every layer and every call.
+  The straightforward version frees and re-allocates about 150 MB of
+  activations on every call.
+- **Attention reads Q, K and V straight out of the packed qkv rows** with
+  strided BLAS calls: no per-head copies, no malloc/free.
+- **Only the final position is computed** past attention in the last layer,
+  and only the final position goes through the lm_head product: about a
+  third less arithmetic than the straightforward version, which computes
+  all 128 positions.
+- **Residual adds are folded into the projection products** (`beta = 1`)
+  and GELU is applied to each block of the MLP product while it is in cache.
+- **Threads split by output column.** Each matrix product is divided into
+  one block of columns per thread, each thread making its own
+  single-threaded OpenBLAS call; attention is split by head. OpenBLAS's own
+  threading divides a 128-row product poorly. Default: one thread per
+  physical core, pinned to it. Override with `--threads=N` or
+  `OMP_NUM_THREADS`. Needs OpenMP (`-fopenmp`); without it the same code
+  runs on one thread.
+
+It gives the same logits as `gpt_forward()` (max difference about 2e-5
+over GPT-2 small, checked by `cngpt bench --fast` and, on a tiny model with
+several batch sizes and thread counts, by `make check`).
+
+---
+
 ## Benchmark Harness
 
 `tests/bench.sh` compiles cngpt with several flag combinations and prints a
@@ -298,33 +344,120 @@ comparison table:
 
 ```sh
 tests/bench.sh --weights=gpt2.bin --iters=30 --seq=128
+tests/bench.sh --weights=gpt2.bin --iters=30 --seq=128 --fast --python-tok-s=511
 ```
 
-GPT-2 small inference (B=1, T=128) is **BLAS-dominated**: the 12 linear
-layers (each a 128×768→768 GEMM) take ~85% of wall time. The AVX2 kernels
-for LayerNorm, GELU, and Softmax improve the remaining ~15%.
+`--fast` benchmarks the optimized forward pass and sweeps its thread count;
+`--python-tok-s=N` adds a "vs Python" column. The Python side is
+`scripts/bench_nanogpt.py`, which times the original nanoGPT (PyTorch,
+eager mode, CPU, no `torch.compile`) on the same work:
 
-**Measured on AMD Ryzen 5 4500U (6C/6T), GCC 13.3, OpenBLAS 0.3.x:**
-
-```
-flags                       tok/s    speedup
---------------------------  -------  -------
--O2  (scalar)               196.9     1.00x
--O3 -march=native -ffast-math  224.3  1.14x
-
-OpenBLAS thread sweep (AVX2 build, batch=1 seq=128):
-  OPENBLAS_NUM_THREADS=1    250.2    1.00x
-  OPENBLAS_NUM_THREADS=2    242.6    0.97x  ← threading overhead dominates
-  OPENBLAS_NUM_THREADS=4    238.9    0.95x     for small batch=1 GEMMs
+```sh
+python3 scripts/bench_nanogpt.py --nanogpt=/path/to/nanoGPT --threads=1
 ```
 
-**Key observations:**
-- For batch=1 inference, `OPENBLAS_NUM_THREADS=1` is fastest. Small GEMMs
-  (128×768) don't amortize thread launch overhead.
-- Threading helps at larger batch sizes (B≥4) where each GEMM is bigger.
-- The speedup from AVX2 kernels (LayerNorm/GELU/Softmax) is modest here
-  because those ops represent <15% of total time at this batch/seq size.
-  At very short sequences (T=8–16) or larger C, the balance shifts.
+### Results
+
+Machine: AMD Ryzen 5 7600 (6 cores, 12 threads), Debian 13 (Linux 6.12),
+gcc 14.2.0, OpenBLAS 0.3.29 (Debian, pthreads), Python 3.13.5, PyTorch
+2.15.0 CPU build (MKL). GPT-2 small (124M parameters), batch=1, seq=128.
+One forward pass is 128 tokens, so tok/s = 128 / seconds per forward pass.
+Each figure is the median of 3 runs of 30 forward passes (training: 3 runs,
+steady-state step time). The machine was shared with other jobs while
+these ran (load average 9 to 13 on 12 logical CPUs), so expect roughly
+10 percent noise between runs.
+
+### Python baseline (nanoGPT, PyTorch CPU)
+
+| | 1 thread | 6 threads |
+|---|---|---|
+| forward pass, ms | 250.4 | 92.4 |
+| forward pass, tok/s | 511.2 | 1384.8 |
+| training step, ms | 1560 | 692 |
+
+### Straightforward forward pass (gpt_forward) - compiler flag sweep, 1 thread
+
+| Flags | tok/s | vs Python |
+|---|---|---|
+| `-O2` | 319.9 | 0.63x |
+| `-O3` | 324.8 | 0.64x |
+| `-Ofast` | 341.8 | 0.67x |
+| `-O3 -march=native` | **356.3** | 0.70x |
+| `-O3 -march=native -mfma` | 292.5 | 0.57x |
+| `-O3 -march=native -ffast-math` | 344.6 | 0.67x |
+| `-O3 -march=native -ffast-math -funroll-loops` | 311.8 | 0.61x |
+| `-O3 -march=native -ffast-math -flto` | 302.4 | 0.59x |
+| `-O3 -march=native -ffast-math -funroll-loops -flto` | 313.7 | 0.61x |
+
+### Fast forward pass (--fast) - compiler flag sweep, 1 thread
+
+| Flags | tok/s | vs Python |
+|---|---|---|
+| `-O2` | 484.8 | 0.95x |
+| `-O3` | 484.0 | 0.95x |
+| `-Ofast` | 534.9 | 1.05x |
+| `-O3 -march=native` | 548.9 | 1.07x |
+| `-O3 -march=native -mfma` | 521.8 | 1.02x |
+| `-O3 -march=native -ffast-math` | 543.3 | 1.06x |
+| `-O3 -march=native -ffast-math -funroll-loops` | **567.4** | 1.11x |
+| `-O3 -march=native -ffast-math -flto` | 556.0 | 1.09x |
+| `-O3 -march=native -ffast-math -funroll-loops -flto` | 550.9 | 1.08x |
+
+### Fast forward pass - threads (`-O3 -march=native -ffast-math -funroll-loops`)
+
+| Threads | tok/s | vs 1 thread | vs Python (same threads) |
+|---|---|---|---|
+| 1 | 546.2 | 1.00x | 1.07x |
+| 2 | 921.1 | 1.69x | - |
+| 3 | 1256.0 | 2.30x | - |
+| 4 | 1438.6 | 2.63x | - |
+| 5 | 1705.2 | 3.12x | - |
+| 6 | 2261.6 | 4.14x | 1.63x |
+| 12 | 180.0 | 0.33x | - |
+
+### Training step (forward + backward + AdamW), batch=1 seq=128
+
+| | 1 thread | 6 threads |
+|---|---|---|
+| nanoGPT (PyTorch), ms | 1560 | 692 |
+| cngpt, ms | 1104 | 603 |
+| cngpt speedup | 1.41x | 1.15x |
+
+### Summary, GPT-2 small forward pass, seq=128, tok/s
+
+| Implementation | 1 thread | vs Python | 6 threads | vs Python |
+|---|---|---|---|---|
+| nanoGPT (PyTorch CPU) | 511 | 1.00x | 1385 | 1.00x |
+| cngpt, straightforward | 320 | 0.63x | 619 | 0.45x |
+| cngpt --fast | 546 | 1.07x | 2262 | 1.63x |
+
+### Key observations
+
+- **The straightforward `gpt_forward` is slower than PyTorch** (about 0.6x at
+  one thread). It does more arithmetic (logits for all 128 positions where
+  PyTorch computes the last one) and re-allocates its activation buffers on
+  every call. It is built for training, not for speed.
+- **`--fast` is about 1.1x PyTorch at one thread and 1.6x at six.** The
+  matrix products themselves are not the difference: measured separately at
+  one thread, OpenBLAS runs the four 128-row GPT-2 products at 85 to 98
+  GFLOP/s and PyTorch's `linear` at 64 to 78 GFLOP/s on this CPU. The work
+  PyTorch does not skip and the allocation churn are what the fast path
+  removes. Outside OpenBLAS, only about 5 percent of the time is spent in
+  GELU, softmax and layernorm.
+- **Threading is where the largest gap is.** OpenBLAS's own threading of
+  these small products stops scaling at about 4 threads (634 tok/s
+  straightforward); splitting by column across single-threaded calls scales
+  4.1x on 6 cores.
+- **More threads than physical cores is much slower**: 12 threads on 6
+  cores gives 180 tok/s, because two threads sharing a core's FMA units gain
+  nothing and their spin-waiting barriers stall every product. The default
+  therefore uses one thread per physical core and pins them.
+- `-march=native` is the flag that matters. `-mfma` on its own did not help
+  in this run, and `-flto` and `-funroll-loops` are within the noise.
+- **Training**: `cngpt train` is 1.4x faster per step than nanoGPT on CPU at
+  one thread and 1.15x at six, even with the straightforward forward pass.
+- Benchmark inputs are fixed token ids; only timing is compared. Numbers
+  from other CPUs will differ; `tests/bench.sh` reproduces the sweep.
 
 ---
 
@@ -463,13 +596,17 @@ cngpt/
 │   ├── cngpt.c              CLI: train / sample / bench subcommands
 │   ├── model.h / model.c    GPT forward + backward + AdamW
 │   ├── ops.h / ops.c        BLAS-backed tensor primitives
+│   ├── fast.h / fast.c      optimized inference forward pass (--fast)
 │   ├── dataloader.h / .c    mmap binary token loader
 │   └── tokenizer.h / .c     BPE decode (inference display)
 ├── scripts/
-│   └── export_weights.py    HuggingFace GPT-2 → flat binary
+│   ├── export_weights.py    HuggingFace GPT-2 → flat binary
+│   └── bench_nanogpt.py     times original nanoGPT (PyTorch CPU) for comparison
 ├── tests/
 │   ├── bench.sh             compiler-flag sweep harness
-│   └── check_ops.c          unit tests (linear, layernorm, gelu, softmax, CE)
+│   ├── check_ops.c          unit tests (linear, layernorm, gelu, softmax, CE)
+│   ├── check_grad.c         numerical gradient check
+│   └── check_fast.c         fast forward pass agrees with gpt_forward
 ├── man/
 │   └── cngpt.1              troff manpage
 ├── README.md
@@ -484,9 +621,9 @@ cngpt/
 
 ## Performance Tips
 
-1. **Compiler flags matter**: `-O3 -march=native -ffast-math` typically gives
-   1.6–1.7× vs `-O2`. PGO adds another ~10%. Use `tests/bench.sh` to measure
-   on your CPU.
+1. **Compiler flags matter**: `-O3 -march=native` gives about 1.1x over `-O2`
+   on the fast path (see the results above); the other flags are within
+   noise on this machine. Use `tests/bench.sh` to measure on your CPU.
 
 2. **OpenBLAS threading**: Set `OPENBLAS_NUM_THREADS` to your physical core
    count. For batch=1 inference, 1–4 threads is usually optimal (diminishing
@@ -512,7 +649,7 @@ cngpt/
 ### Ops unit tests
 
 ```sh
-make check          # runs check_ops and check_grad
+make check          # runs check_ops, check_grad and check_fast
 ```
 
 `tests/check_ops` verifies each primitive against known values:
